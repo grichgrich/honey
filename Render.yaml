@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: space-conquest
+    env: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: node server.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: VITE_API_BASE_URL
+        fromService:
+          name: space-conquest
+          type: web
+          property: url
+      - key: VITE_WS_URL
+        fromService:
+          name: space-conquest
+          type: web
+          property: url
+    healthCheckPath: /health
+    autoDeploy: true
+

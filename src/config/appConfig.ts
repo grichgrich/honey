@@ -7,7 +7,7 @@ export const SERVER_CONFIG = {
   
   // API base URL and WS URL can be injected at build-time via Vite env
   API_BASE_URL: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL)
-    || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8001` : 'http://localhost:8001'),
+    || (typeof window !== 'undefined' ? window.location.origin : 'http://localhost:8001'),
   
   WEBSOCKET_URL: (() => {
     const envWs = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_WS_URL) as string | undefined;
@@ -21,7 +21,8 @@ export const SERVER_CONFIG = {
       } catch {}
     }
     if (typeof window !== 'undefined') {
-      return `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8001/ws`;
+      const wsScheme = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      return `${wsScheme}://${window.location.host}/ws`;
     }
     return 'ws://localhost:8001/ws';
   })(),
