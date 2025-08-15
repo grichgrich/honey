@@ -6,20 +6,30 @@
 
 import express from 'express';
 import http from 'http';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { WebSocketServer } from 'ws';
 import cors from 'cors';
 import { v4 as uuidv4 } from 'uuid';
 
 const app = express();
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
 // Middleware
-app.use(cors({
-  origin: ['http://localhost:5001', 'http://localhost:5173', 'http://localhost:3000'],
-  credentials: true
-}));
+// Allow all origins in hosted envs; tighten later if needed
+app.use(cors());
 app.use(express.json());
+
+// Serve static frontend build if present
+const distDir = path.join(__dirname, 'dist');
+app.use(express.static(distDir));
+app.get('*', (_req, res, next) => {
+  const file = path.join(distDir, 'index.html');
+  res.sendFile(file, (err) => { if (err) next(); });
+});
 
 // WebSocket connection tracking
 const connections = new Set();

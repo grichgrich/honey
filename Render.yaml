@@ -19,5 +19,9 @@ services:
           type: web
           property: url
     healthCheckPath: /health
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /
     autoDeploy: true
 
