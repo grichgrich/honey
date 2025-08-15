@@ -1,0 +1,94 @@
+/* Reset */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: 'Arial', sans-serif;
+  background: #000;
+  color: #fff;
+  overflow: hidden;
+}
+
+html, body, #root, .app {
+  width: 100%;
+  height: 100%;
+}
+
+canvas {
+  display: block;
+}
+
+/* Game UI */
+.game-container {
+  width: 100vw;
+  height: 100vh;
+  position: relative;
+}
+
+/* Wallet Button Styles */
+.wallet-adapter-button {
+  background-color: #44f !important;
+  border: none !important;
+  border-radius: 5px !important;
+  color: white !important;
+  cursor: pointer !important;
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  padding: 12px 20px !important;
+  transition: background-color 0.2s ease !important;
+}
+
+.wallet-adapter-button:hover {
+  background-color: #66f !important;
+}
+
+.wallet-adapter-button:not([disabled]):hover {
+  background-color: #66f !important;
+}
+
+/* Loading and Error States */
+.loading {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: rgba(0, 0, 0, 0.8);
+  padding: 20px;
+  border-radius: 10px;
+  z-index: 1000;
+}
+
+.error {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: rgba(255, 0, 0, 0.8);
+  padding: 10px 20px;
+  border-radius: 5px;
+  z-index: 1000;
+}
+
+/* Game Elements */
+.territory {
+  cursor: pointer;
+  transition: transform 0.2s;
+}
+
+.territory:hover {
+  transform: scale(1.1);
+}
+
+/* Animations */
+@keyframes pulse {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.05); }
+  100% { transform: scale(1); }
+}
+
+.pulse {
+  animation: pulse 2s infinite;
+}

@@ -1,0 +1,2852 @@
+import React, { useRef, Suspense, useState, useEffect, useMemo, useCallback } from 'react';
+import { Canvas } from '@react-three/fiber';
+import { Stars, OrbitControls, Environment, Text, Html } from '@react-three/drei';
+import { useThree } from '@react-three/fiber';
+import { EffectComposer, Bloom, GodRays } from '@react-three/postprocessing';
+import { useGameContext } from '../context/GameContext';
+import Territory from './Territory';
+import Resource from './Resource';
+import { useFrame } from '@react-three/fiber';
+import ParticleSystem from './effects/ParticleSystem';
+import OrbitSwarm from './eufloria/OrbitSwarm';
+import SeedTrees from './eufloria/SeedTrees';
+import Satellites from './effects/Satellites';
+import DefenseRing from './effects/DefenseRing';
+import HarvestBeam from './effects/HarvestBeam';
+import * as THREE from 'three';
+import { CombatSystem } from '../services/CombatSystem';
+import { Character } from '../types/game';
+import { LeverageService } from '../services/LeverageService';
+import { HoneycombService } from '../services/honeycomb';
+// import { TraitEvolutionSystem } from '../services/TraitEvolutionSystem';
+import { ResourceManager } from '../services/ResourceManager';
+
+type ActionEffect = { id: string; type: string; position: [number, number, number]; start: number } | null;
+
+type Flight = {
+  id: string;
+  start: number;
+  durationMs: number;
+  from: [number, number, number];
+  to: [number, number, number];
+  count: number;
+  owner: string;
+  fromId?: string;
+  toId?: string;
+  amount?: number;
+};
+
+type BattleParticle = {
+  x: number; y: number; z: number;
+  vx: number; vy: number; vz: number;
+  life: number; maxLife: number;
+};
+
+type LocalBattle = {
+  id: string;
+  from: [number, number, number];
+  to: [number, number, number];
+  attackers: { count: number, owner: string };
+  defenders: { count: number, owner: string };
+  attackerParticles: BattleParticle[];
+  defenderParticles: BattleParticle[];
+  sparks: BattleParticle[];
+  createdAt: number;
+  lastUpdated: number;
+};
+
+const ARENA_RADIUS = 2.5;
+
+// Global variables for WebGL and development state management
+let globalContextLossCount = 0;
+let globalWebGLRenderer: any = null;
+let globalHmrCount = 0;
+const MAX_CONTEXT_LOSS = 3;
+
+// Development mode renderer selection
+const isDev = typeof window !== 'undefined' && (import.meta.env?.DEV || process.env.NODE_ENV === 'development');
+const USE_SIMPLE_RENDERER = isDev;
+
+// Simple renderer for development
+const SimpleRenderer: React.FC<{ children?: React.ReactNode }> = ({ children }) => {
+  return (
+    <div style={{
+      position: 'relative',
+      width: '100%',
+      height: '100%',
+      background: 'linear-gradient(135deg, #001122, #003344)',
+      display: 'flex',
+      alignItems: 'center',
+      justifyContent: 'center',
+      color: '#ffffff',
+      fontSize: '14px'
+    }}>
+      <div style={{
+        position: 'absolute',
+        top: '10px',
+        left: '10px',
+        background: 'rgba(0,0,0,0.5)',
+        padding: '8px',
+        borderRadius: '4px'
+      }}>
+        🔧 Development Mode - Simple Renderer
+      </div>
+      {children}
+    </div>
+  );
+};
+
+// Early WebGL capability check
+const checkWebGLSupport = () => {
+  if (typeof window === 'undefined') return true;
+  
+  try {
+    const canvas = document.createElement('canvas');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    if (!gl) {
+      console.warn('WebGL not supported, enabling safe mode');
+      localStorage.setItem('webgl_safe_mode', 'true');
+      return false;
+    }
+    return true;
+  } catch (e) {
+    console.warn('WebGL check failed, enabling safe mode:', e);
+    localStorage.setItem('webgl_safe_mode', 'true');
+    return false;
+  }
+};
+
+const FlightMesh: React.FC<{ flight: Flight; onDone: (id: string) => void; speed: number, playerId: string | null }> = ({ flight, onDone, speed, playerId }) => {
+  const meshRef = useRef<THREE.InstancedMesh>(null);
+  const dummy = useMemo(() => new THREE.Object3D(), []);
+  const offsets = useMemo(() => new Array(flight.count).fill(0).map(() => Math.random() * 4000), [flight.count]);
+
+  const bezierPoint = (t: number): [number, number, number] => {
+    const [x1, y1, z1] = flight.from;
+    const [x3, y3, z3] = flight.to;
+    const cx = (x1 + x3) / 2;
+    const cz = (z1 + z3) / 2;
+    const cy = Math.max(y1, y3) + 2.5;
+    const u = 1 - t;
+    const x = u * u * x1 + 2 * u * t * cx + t * t * x3;
+    const y = u * u * y1 + 2 * u * t * cy + t * t * y3;
+    const z = u * u * z1 + 2 * u * t * cz + t * t * z3;
+    return [x, y, z];
+  };
+
+  useFrame(() => {
+    if (!meshRef.current) return;
+    const now = performance.now();
+    let anyActive = false;
+    let activeCount = 0;
+    
+    for (let i = 0; i < flight.count; i++) {
+      const elapsed = (now - flight.start - offsets[i]) * Math.max(1.0, speed);
+      const rawT = Math.min(1, Math.max(0, elapsed / flight.durationMs));
+      
+      // More aggressive completion - units finish at 80%
+      if (rawT < 0.80) {
+        anyActive = true;
+        activeCount++;
+        
+        const p = bezierPoint(rawT);
+      dummy.position.set(p[0], p[1], p[2]);
+      const s = 0.06;
+      dummy.scale.set(s, s, s);
+      dummy.updateMatrix();
+      meshRef.current.setMatrixAt(i, dummy.matrix);
+      } else {
+        // Hide completed units
+        dummy.scale.set(0, 0, 0);
+      dummy.updateMatrix();
+      meshRef.current.setMatrixAt(i, dummy.matrix);
+      }
+    }
+    meshRef.current.instanceMatrix.needsUpdate = true;
+    
+    if (!anyActive) {
+      onDone(flight.id);
+    }
+  });
+
+  const flightColor = ((): string => {
+    const owner = flight.owner as any;
+    const pid = playerId || 'guest_local';
+    
+    // Check if this is player's units
+    const isPlayerUnits = !owner || owner === 'player' || owner === pid || 
+                         (typeof owner === 'string' && (
+                           owner.startsWith('127.0.0.1:') || 
+                           owner === 'localhost' ||
+                           owner.includes('player') ||
+                           owner === 'guest_local'
+                         ));
+    
+    // Player units: bright green, enemy units: bright red, neutral/unknown: blue
+    if (isPlayerUnits) return "#44ff44"; // Bright green for player
+    if (owner && typeof owner === 'string' && owner.startsWith('bot_')) return "#ff4444"; // Red for bots
+    return "#4488ff"; // Blue for neutral/unknown
+  })();
+
+  return (
+    <instancedMesh ref={meshRef} args={[undefined as any, undefined as any, flight.count]}>
+      <sphereGeometry args={[1, 8, 8]} />
+      <meshBasicMaterial color={flightColor} transparent opacity={0.9} blending={THREE.AdditiveBlending} />
+    </instancedMesh>
+  );
+};
+
+const Trail: React.FC<{ flight: Flight, speed: number }> = ({ flight, speed }) => {
+  const lineRef = useRef<any>();
+  const points = useMemo(() => {
+    const [x1, y1, z1] = flight.from;
+    const [x3, y3, z3] = flight.to;
+    const cx = (x1 + x3) / 2 + (Math.random() - 0.5) * 4;
+    const cz = (z1 + z3) / 2 + (Math.random() - 0.5) * 4;
+    const cy = Math.max(y1, y3) + 3.5 + (Math.random() - 0.5) * 2;
+    
+    // Create curve points manually instead of using THREE.Path
+    const curve = new THREE.QuadraticBezierCurve3(
+      new THREE.Vector3(x1, y1, z1),
+      new THREE.Vector3(cx, cy, cz),
+      new THREE.Vector3(x3, y3, z3)
+    );
+    return curve.getPoints(50);
+  }, [flight]);
+
+  const geometry = useMemo(() => new THREE.BufferGeometry().setFromPoints(points), [points]);
+  
+  useFrame(() => {
+    if (lineRef.current?.material?.userData?.shader) {
+      const elapsed = (performance.now() - flight.start) * Math.max(0.1, speed);
+      const progress = Math.min(1.0, elapsed / flight.durationMs);
+      lineRef.current.material.userData.shader.uniforms.dashOffset.value = 1 - progress;
+    }
+  });
+
+  return (
+    <line ref={lineRef}>
+      <primitive attach="geometry" object={geometry} />
+      <lineDashedMaterial
+        color="#aaddff"
+        dashSize={0.2}
+        gapSize={0.1}
+        transparent
+        opacity={0.6}
+        linewidth={1}
+        onBeforeCompile={(shader) => {
+          (lineRef.current.material as any).userData.shader = shader;
+          shader.uniforms.dashOffset = { value: 1 };
+          shader.fragmentShader = `
+            uniform float dashOffset;
+            ${shader.fragmentShader.replace(
+              'if ( mod( vLineDistance, totalSize ) > dashSize ) { discard; }',
+              'if ( mod( vLineDistance + dashOffset * totalSize, totalSize ) > dashSize ) { discard; }'
+            )}
+          `;
+        }}
+      />
+    </line>
+  );
+};
+
+const UnitFlights: React.FC<{ flights: Flight[]; onDone: (id: string) => void; speed: number, playerId: string | null }> = ({ flights, onDone, speed, playerId }) => {
+  
+  return (
+    <group>
+      {flights.map(f => (
+        <group key={f.id}>
+          <Trail flight={f} speed={speed} />
+          <FlightMesh flight={f} onDone={onDone} speed={speed} playerId={playerId} />
+        </group>
+      ))}
+    </group>
+  );
+};
+
+const EffectsLayer: React.FC<{
+  actionEffect: ActionEffect;
+  effectRef: React.MutableRefObject<{ life: number }>;
+  setActionEffect: React.Dispatch<React.SetStateAction<ActionEffect>>;
+  speed: number;
+}> = ({ actionEffect, effectRef, setActionEffect, speed }) => {
+  useFrame((_, delta) => {
+    if (!actionEffect) return;
+    effectRef.current.life += delta * 1000 * Math.max(0.25, speed); // ms
+    if (effectRef.current.life > 1800) {
+      setActionEffect(null);
+      effectRef.current.life = 0;
+    }
+  });
+
+  if (!actionEffect) return null;
+
+  return (
+    <group>
+      {/* Attack flash */}
+      {actionEffect.type === 'attack' && (
+        <mesh position={actionEffect.position}>
+          <sphereGeometry args={[0.6 + effectRef.current.life / 1200, 24, 24]} />
+          <meshBasicMaterial color="#ff6666" transparent opacity={Math.max(0, 0.9 - effectRef.current.life / 800)} blending={THREE.AdditiveBlending} />
+        </mesh>
+      )}
+      {(actionEffect.type === 'defend' || actionEffect.type === 'claim') && (
+        <mesh position={actionEffect.position}>
+          <ringGeometry args={[1.4 + effectRef.current.life / 600, 1.6 + effectRef.current.life / 600, 64]} />
+          <meshBasicMaterial color={actionEffect.type === 'defend' ? '#44aaff' : '#44ff88'} transparent opacity={Math.max(0, 0.8 - effectRef.current.life / 900)} blending={THREE.AdditiveBlending} />
+        </mesh>
+      )}
+      {actionEffect.type === 'research' && (
+        <group position={[actionEffect.position[0], actionEffect.position[1] + 1, actionEffect.position[2]]}>
+          <ParticleSystem count={10} radius={0.8} speed={0.3} color="#ffee88" intensity={1.0} />
+        </group>
+      )}
+      {actionEffect.type === 'harvest' && (
+        <line>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              count={2}
+              array={new Float32Array([
+                0, 0, 0,
+                actionEffect.position[0], actionEffect.position[1], actionEffect.position[2]
+              ])}
+              itemSize={3}
+            />
+          </bufferGeometry>
+          <lineBasicMaterial color="#ffff66" transparent opacity={Math.max(0, 1 - effectRef.current.life / 900)} />
+        </line>
+      )}
+    </group>
+  );
+};
+
+const GameWorld: React.FC = () => {
+  // Early WebGL support check
+  const webglSupported = checkWebGLSupport();
+  
+  // Development mode renderer toggle
+  const [useSimpleRenderer, setUseSimpleRenderer] = useState(USE_SIMPLE_RENDERER);
+  const [canvasKey, setCanvasKey] = useState(0);
+  const [hmrCount, setHmrCount] = useState(globalHmrCount);
+  const skipWebGL = hmrCount > 5; // Skip WebGL after 5 HMR updates
+  
+  // Development mode controls
+  const isDevelopment = import.meta.env.DEV || process.env.NODE_ENV === 'development';
+  
+  // Development mode renderer toggle button
+  const DevControls = () => isDevelopment ? (
+    <div style={{
+      position: 'fixed',
+      top: '10px',
+      right: '10px',
+      zIndex: 9999,
+      display: 'flex',
+      gap: '10px'
+    }}>
+      <button
+        onClick={() => setUseSimpleRenderer(!useSimpleRenderer)}
+        style={{
+          background: useSimpleRenderer ? '#44aa44' : '#aa4444',
+          color: 'white',
+          border: 'none',
+          padding: '8px 16px',
+          borderRadius: '4px',
+          cursor: 'pointer'
+        }}
+      >
+        {useSimpleRenderer ? '🎮 Enable 3D' : '🔧 Simple Mode'}
+      </button>
+      <button
+        onClick={() => setCanvasKey(k => k + 1)}
+        style={{
+          background: '#4444aa',
+          color: 'white',
+          border: 'none',
+          padding: '8px 16px',
+          borderRadius: '4px',
+          cursor: 'pointer'
+        }}
+      >
+        🔄 Reset Canvas
+      </button>
+    </div>
+  ) : null;
+  
+  // Check for safe mode to prevent WebGL infinite loops
+  const safeMode = typeof window !== 'undefined' && 
+    (!webglSupported ||
+     localStorage.getItem('webgl_safe_mode') === 'true' || 
+     localStorage.getItem('webgl_safe_mode') === 'permanent' ||
+     (!import.meta.env.DEV && globalContextLossCount >= MAX_CONTEXT_LOSS)); // Only trigger safe mode in production
+  
+  const { territories, resources, world, sendMessage, attackPlanet, moveUnits, playerId, harvestPlanet, buildSatellite, deployResearch, activeCharacter, leverageMultiplier, leverageDetail } = useGameContext();
+  // const [selectedTerritory, setSelectedTerritory] = useState<string | null>(null);
+  const [cameraTarget, setCameraTarget] = useState<[number, number, number]>([0, 0, 0]);
+  const [actionEffect, setActionEffect] = useState<ActionEffect>(null);
+  const effectRef = useRef<{ life: number }>({ life: 0 });
+  const [galaxyView, setGalaxyView] = useState<boolean>(false);
+  const [flights, setFlights] = useState<Flight[]>([]);
+  const [focusTarget, setFocusTarget] = useState<[number, number, number] | null>(null);
+  const [selectedPlanet, setSelectedPlanet] = useState<any | null>(null);
+  const [selectedSourcePlanetId, setSelectedSourcePlanetId] = useState<string | null>(null);
+  const [selectedSourcePlanetIds, setSelectedSourcePlanetIds] = useState<string[]>([]);
+  const [sendAmount, setSendAmount] = useState<number>(60);
+  const [hoveredPlanet, setHoveredPlanet] = useState<any | null>(null);
+  const [speed, setSpeed] = useState<number>(1); // 1x, 2x, 3x
+  const battlesRef = useRef<LocalBattle[]>([]);
+  const sunRef = useRef<THREE.Mesh>(null);
+  const [combatSystem, setCombatSystem] = useState<CombatSystem | null>(null);
+  // const [autoSelectedFriendly, setAutoSelectedFriendly] = useState<any | null>(null);
+  const [leverageSvc, setLeverageSvc] = useState<LeverageService | null>(null);
+  const [attackEstimate, setAttackEstimate] = useState<{ power: number; defense: number; verdict: 'Win' | 'Close' | 'Unlikely' } | null>(null);
+  const [lastOutcome, setLastOutcome] = useState<{ planetId: string; success: boolean } | null>(null);
+  const [showBattleHelp, setShowBattleHelp] = useState<boolean>(false);
+  const [showHarvestHelp, setShowHarvestHelp] = useState<boolean>(false);
+  const [showDefenseHelp, setShowDefenseHelp] = useState<boolean>(false);
+  const [showResearchHelp, setShowResearchHelp] = useState<boolean>(false);
+  const [stockpile, setStockpile] = useState<{ energy: number; minerals: number }>(() => ({ energy: 0, minerals: 0 }));
+  const [activeBeams, setActiveBeams] = useState<Array<{ id: string; from: [number,number,number]; to: [number,number,number]; type: 'energy'|'minerals' }>>([]);
+  const [researchLevel, setResearchLevel] = useState<number>(0);
+  const [showTutorial, setShowTutorial] = useState<boolean>(false);
+  const [tutorialStep, setTutorialStep] = useState<number>(0);
+  const [combatLog, setCombatLog] = useState<Array<{id: string, message: string, timestamp: number, type: 'attack' | 'defense' | 'info'}>>([]);
+  const [actionNotifications, setActionNotifications] = useState<Array<{id: string, message: string, type: 'success' | 'error' | 'info', timestamp: number}>>([]);
+  
+  // Dynamic performance mode based on WebGL stability
+  const [performanceMode, setPerformanceMode] = useState(0); // 0=full, 1=reduced, 2=minimal
+  
+  // Clear any existing safe mode setting
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.removeItem('webgl_safe_mode');
+    }
+  }, []);
+
+  useEffect(() => {
+    const leverageService = new LeverageService();
+    const honeycombService = new HoneycombService();
+    const resourceManager = new ResourceManager();
+    
+    // Create a minimal TraitEvolutionSystem stub for CombatSystem
+    const traitSystemStub = {
+      computeAttackBonus: () => 0,
+      computeDefenseBonus: () => 0,
+      evolveTraits: () => Promise.resolve(),
+      getTraits: () => []
+    } as any;
+    
+    const cs = new CombatSystem(leverageService, honeycombService, traitSystemStub, resourceManager);
+    setCombatSystem(cs);
+    setLeverageSvc(leverageService);
+  }, []);
+
+  // Sync local HUD stockpile from character resources
+  useEffect(() => {
+    try {
+      const e = Math.floor(activeCharacter?.resources?.energy ?? stockpile.energy);
+      const m = Math.floor(activeCharacter?.resources?.minerals ?? stockpile.minerals);
+      setStockpile({ energy: e, minerals: m });
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeCharacter?.resources?.energy, activeCharacter?.resources?.minerals]);
+
+  // Track research updates for UI summaries
+  useEffect(() => {
+    const onResearch = (e: any) => {
+      try {
+        const lvl = Number(e?.detail?.level ?? 0);
+        if (!isNaN(lvl)) setResearchLevel(lvl);
+      } catch {}
+    };
+    window.addEventListener('research-update', onResearch as EventListener);
+    return () => window.removeEventListener('research-update', onResearch as EventListener);
+  }, []);
+
+  // Helper function to show action notifications
+  const showNotification = useCallback((message: string, type: 'success' | 'error' | 'info' = 'info') => {
+    const notification = {
+      id: `notification-${Date.now()}`,
+      message,
+      type,
+      timestamp: Date.now()
+    };
+    setActionNotifications(prev => [...prev, notification].slice(-5)); // Keep only last 5
+    
+    // Auto-remove after 5 seconds
+    setTimeout(() => {
+      setActionNotifications(prev => prev.filter(n => n.id !== notification.id));
+    }, 5000);
+  }, []);
+
+  // Safe PostProcessing Component with Error Boundary
+  const PostProcessingWrapper: React.FC<{ sunRef: React.RefObject<any> }> = ({ sunRef }) => {
+    const [hasError, setHasError] = useState(false);
+    const { gl } = useThree();
+
+    // Reset error state when WebGL context is restored
+    useEffect(() => {
+      const handleContextRestored = () => {
+        console.log('WebGL context restored, re-enabling post-processing');
+        setHasError(false);
+      };
+
+      const handleContextLost = () => {
+        console.log('WebGL context lost, disabling post-processing');
+        setHasError(true);
+      };
+
+      if (gl && gl.domElement) {
+        gl.domElement.addEventListener('webglcontextrestored', handleContextRestored);
+        gl.domElement.addEventListener('webglcontextlost', handleContextLost);
+        return () => {
+          gl.domElement.removeEventListener('webglcontextrestored', handleContextRestored);
+          gl.domElement.removeEventListener('webglcontextlost', handleContextLost);
+        };
+      }
+    }, [gl]);
+
+    // Don't render post-processing if there's an error or no sun reference
+    if (hasError || !sunRef.current) {
+      return null;
+    }
+
+    try {
+      return (
+        <EffectComposer>
+          <Bloom intensity={0.5} luminanceThreshold={0.4} luminanceSmoothing={0.9} height={300} />
+          <GodRays sun={sunRef.current} />
+        </EffectComposer>
+      );
+    } catch (error) {
+      console.warn('Post-processing effects disabled due to error:', error);
+      setHasError(true);
+      return null;
+    }
+  };
+
+  // Listen for action feedback from GameContext
+  useEffect(() => {
+    const onActionFeedback = (e: any) => {
+      const d = e?.detail;
+      if (!d) return;
+      showNotification(d.message, d.type || 'info');
+    };
+    window.addEventListener('action-feedback', onActionFeedback as EventListener);
+    return () => window.removeEventListener('action-feedback', onActionFeedback as EventListener);
+  }, [showNotification]);
+
+  useEffect(() => {
+    const onBattleStarted = (e: CustomEvent) => {
+      const { from_id, to_id, from_position, to_position, attackers, defenders } = e.detail;
+      const battle: LocalBattle = {
+        id: `${from_id}-${to_id}`,
+        from: [from_position.x, from_position.y, from_position.z],
+        to: [to_position.x, to_position.y, to_position.z],
+        attackers: { count: Math.max(5, attackers.count), owner: attackers.owner },
+        defenders: { count: defenders.count, owner: defenders.owner },
+        attackerParticles: [],
+        defenderParticles: [],
+        sparks: [],
+        createdAt: performance.now(),
+        lastUpdated: performance.now(),
+      } as any;
+      (battle as any).targetId = to_id;
+      battlesRef.current = [...battlesRef.current.filter(b => b.id !== battle.id), battle];
+    };
+
+    const onBattleUpdate = (e: CustomEvent) => {
+      const { planet_id, attackers, defenders } = e.detail;
+      const battle = battlesRef.current.find(b => (b as any).targetId === planet_id || (typeof b.id === 'string' && b.id.endsWith(`-${planet_id}`)));
+      if (battle) {
+        battle.attackers.count = attackers.count;
+        battle.defenders.count = defenders.count;
+        battle.lastUpdated = performance.now();
+      }
+    };
+
+    const onReinforced = (e: CustomEvent) => {
+      const { to_id, amount } = (e as any).detail || {};
+      if (!to_id || !amount) return;
+      const battle = battlesRef.current.find(b => (b as any).targetId === to_id || (typeof b.id === 'string' && b.id.endsWith(`-${to_id}`)));
+      if (battle) {
+        battle.attackers.count = Math.max(0, battle.attackers.count + Math.floor(amount));
+        battle.lastUpdated = performance.now();
+      }
+    };
+
+    window.addEventListener('battle-started', onBattleStarted as EventListener);
+    window.addEventListener('battle-update', onBattleUpdate as EventListener);
+    window.addEventListener('battle-reinforced', onReinforced as EventListener);
+    return () => {
+      window.removeEventListener('battle-started', onBattleStarted as EventListener);
+      window.removeEventListener('battle-update', onBattleUpdate as EventListener);
+      window.removeEventListener('battle-reinforced', onReinforced as EventListener);
+    };
+  }, []);
+
+  // Break camera focus when user scrolls or clicks/drag navigates
+  useEffect(() => {
+    const breakFocus = () => setFocusTarget(null);
+    window.addEventListener('wheel', breakFocus, { passive: true } as any);
+    window.addEventListener('mousedown', breakFocus);
+    return () => {
+      window.removeEventListener('wheel', breakFocus as any);
+      window.removeEventListener('mousedown', breakFocus as any);
+    };
+  }, []);
+
+  // Find a friendly source planet position (prefer nearest to target)
+  const isFriendlyOwner = useCallback((owner?: string | null) => {
+    if (!owner) return false;
+    if (owner === (playerId || '')) return true;
+    // Treat localhost client ids from previous sessions as friendly to avoid port changes breaking ownership visuals
+    if (owner.startsWith('127.0.0.1:')) return true;
+    return false;
+  }, [playerId]);
+
+  const getHomePosition = useCallback((targetPlanetId?: string): { x: number; y: number; z: number } | null => {
+    if (!world || !playerId) return null;
+    const galaxy = world.galaxies?.[0];
+    if (!galaxy) return null;
+    let targetPos: any = null;
+    for (const s of galaxy.systems || []) {
+      for (const p of s.planets || []) {
+        if (p.id === targetPlanetId) { targetPos = p.position; break; }
+      }
+      if (targetPos) break;
+    }
+    const friendly: any[] = [];
+    for (const s of galaxy.systems || []) {
+      for (const p of s.planets || []) {
+        if (isFriendlyOwner(p.controlledBy)) friendly.push(p);
+      }
+    }
+    if (friendly.length === 0) return null;
+    if (!targetPos) return friendly[0].position;
+    let best = friendly[0].position;
+    let bestD = Infinity;
+    for (const p of friendly) {
+      const dx = (p.position.x - targetPos.x);
+      const dy = (p.position.y - targetPos.y);
+      const dz = (p.position.z - targetPos.z);
+      const d = dx*dx + dy*dy + dz*dz;
+      if (d < bestD) { bestD = d; best = p.position; }
+    }
+    return best;
+  }, [world, playerId, isFriendlyOwner]);
+
+  const getPlanetById = useCallback((planetId?: string | null) => {
+    if (!planetId || !world) return null;
+    const galaxy = world.galaxies?.[0];
+    if (!galaxy) return null;
+    for (const s of galaxy.systems || []) {
+      const found = (s.planets || []).find((pp: any) => pp.id === planetId);
+      if (found) return found;
+    }
+    return null;
+  }, [world]);
+
+  const getPlanetPosition = useCallback((planetId: string): [number, number, number] | null => {
+    const planet = getPlanetById(planetId);
+    if (planet && planet.position) {
+      return [planet.position.x, planet.position.y, planet.position.z];
+    }
+    return null;
+  }, [getPlanetById]);
+
+  const getNearestFriendlyPlanet = useCallback((targetPlanetId?: string | null) => {
+    if (!world || !playerId) return null;
+    const galaxy = world.galaxies?.[0];
+    if (!galaxy) return null;
+    let targetPos: any = null;
+    for (const s of galaxy.systems || []) {
+      const found = (s.planets || []).find((pp: any) => pp.id === targetPlanetId);
+      if (found) { targetPos = found.position; break; }
+    }
+    const friendly: any[] = [];
+    for (const s of galaxy.systems || []) {
+      for (const p of s.planets || []) {
+        if (isFriendlyOwner(p.controlledBy)) friendly.push(p);
+      }
+    }
+    if (friendly.length === 0) return null;
+    if (!targetPos) return friendly[0];
+    let best = friendly[0];
+    let bestD = Infinity;
+    for (const p of friendly) {
+      const dx = (p.position.x - targetPos.x);
+      const dy = (p.position.y - targetPos.y);
+      const dz = (p.position.z - targetPos.z);
+      const d = dx*dx + dy*dy + dz*dz;
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    return best;
+  }, [world, playerId, isFriendlyOwner]);
+
+  useEffect(() => {
+    const onAttack = (e: any) => {
+      const d = e?.detail;
+      if (!d) return;
+      const pos = d.position ? [d.position.x, d.position.y, d.position.z] : idToPositionRef.current[d.planetId] || [0,0,0];
+      setActionEffect({ id: d.planetId, type: d.success ? 'attack' : 'defend', position: pos as [number, number, number], start: performance.now() });
+      setLastOutcome({ 
+        planetId: d.planetId, 
+        success: !!d.success
+      });
+      
+      // Add to combat log with enhanced details and consistent messaging
+      const planetName = getPlanetById(d.planetId)?.name || `Planet ${d.planetId}`;
+      const sourcePlanetsInfo = d.source_planets ? 
+        ` from ${d.source_planets.length} planet${d.source_planets.length > 1 ? 's' : ''}` : '';
+      const battleDetails = ` (⚔️ ${(d.attacking_units||0)} vs 🛡️ ${(d.defending_units||0)}, ${(d.attack_power||0).toFixed(0)} vs ${(d.defense_power||0).toFixed(0)} power)`;
+      
+      let logMessage: string;
+      if (d.success) {
+        logMessage = `🏆 Victory! ${planetName} captured${sourcePlanetsInfo}${battleDetails}`;
+      } else {
+        logMessage = `🛡️ Defense held! ${planetName} repelled attack${sourcePlanetsInfo}${battleDetails}`;
+      }
+      
+      setCombatLog(prev => [...prev, {
+        id: `${d.planetId}-${Date.now()}`,
+        message: logMessage,
+        timestamp: Date.now(),
+        type: d.success ? 'attack' : 'defense' as 'attack' | 'defense' | 'info'
+      }].slice(-10)); // Keep only last 10 entries
+      
+      // Show action notification for battle result
+      showNotification(
+        d.success ? 
+          `🏆 Victory! ${planetName} captured!` : 
+          `🛡️ Defense held! ${planetName} attack repelled!`,
+        d.success ? 'success' : 'info'
+      );
+      
+      effectRef.current.life = 0;
+    };
+    window.addEventListener('attack-result', onAttack as EventListener);
+    return () => window.removeEventListener('attack-result', onAttack as EventListener);
+  }, [getPlanetById]);
+
+  // Generate a more organized world layout
+  const generateTerritoryPositions = () => {
+    const positions = [];
+    const radius = 15;
+    const levels = 3;
+    
+    for (let level = 0; level < levels; level++) {
+      const levelRadius = radius * (level + 1) / levels;
+      const count = Math.max(6, level * 4);
+      
+      for (let i = 0; i < count; i++) {
+        const angle = (i / count) * Math.PI * 2;
+        const x = Math.cos(angle) * levelRadius;
+        const z = Math.sin(angle) * levelRadius;
+        const y = (Math.random() - 0.5) * 4;
+        
+        positions.push([x, y, z]);
+      }
+    }
+    
+    return positions;
+  };
+
+  const territoryPositions = useMemo(() => generateTerritoryPositions(), []);
+
+  // Will be filled after territories list is constructed
+  const idToPositionRef = useRef<Record<string, [number, number, number]>>({});
+
+  useEffect(() => {
+    const handler = (e: any) => {
+      if (e && e.detail && typeof e.detail.x === 'number') {
+        // In galaxy view, only honor forced centers to avoid stealing focus
+        if (galaxyView && !e.detail?.force) return;
+        setCameraTarget([e.detail.x, e.detail.y ?? 0, e.detail.z ?? 0]);
+        setFocusTarget([e.detail.x, e.detail.y ?? 0, e.detail.z ?? 0]);
+      } else {
+        // Only recenter on hub when not in galaxy view to avoid overriding planet focus
+        if (!galaxyView) {
+          // setSelectedTerritory(null);
+          setCameraTarget([0, 0, 0]);
+          setFocusTarget(null);
+        }
+      }
+    };
+    window.addEventListener('center-camera', handler as EventListener);
+    const toggle = () => {
+      setGalaxyView(v => !v);
+      // Ensure world snapshot exists when toggling to galaxy view
+      try { if (typeof window !== 'undefined') { (window as any).requestWorld?.() } } catch {}
+    };
+    window.addEventListener('toggle-galaxy-view', toggle as EventListener);
+    
+    const speedHandler = (e: any) => {
+      if (e.detail?.speed) {
+        setSpeed(e.detail.speed);
+      }
+    };
+    window.addEventListener('set-speed', speedHandler as EventListener);
+    
+    return () => {
+      window.removeEventListener('center-camera', handler as EventListener);
+      window.removeEventListener('toggle-galaxy-view', toggle as EventListener);
+      window.removeEventListener('set-speed', speedHandler as EventListener);
+    };
+  }, [galaxyView]);
+
+  useEffect(() => {
+    if (selectedPlanet && !isFriendlyOwner(selectedPlanet.controlledBy)) {
+      const nearest = getNearestFriendlyPlanet(selectedPlanet.id);
+      if (nearest) {
+        setSelectedSourcePlanetId(nearest.id);
+        // setAutoSelectedFriendly(nearest);
+      }
+    } else {
+      // setAutoSelectedFriendly(null);
+    }
+
+    // Default multi-source selection to all friendly (home) planets
+    try {
+      const friendly = (world?.galaxies?.[0]?.systems || []).flatMap((s: any) => (s.planets || []))
+        .filter((pp: any) => isFriendlyOwner(pp.controlledBy))
+        .map((pp: any) => pp.id);
+      setSelectedSourcePlanetIds(friendly);
+    } catch {}
+  }, [selectedPlanet, getNearestFriendlyPlanet, isFriendlyOwner, world]);
+
+  // Attack power estimate whenever selection changes
+  useEffect(() => {
+    let cancelled = false;
+    const calc = async () => {
+      if (!selectedPlanet) { setAttackEstimate(null); return; }
+      const sources = (selectedSourcePlanetIds && selectedSourcePlanetIds.length > 0)
+        ? selectedSourcePlanetIds
+        : (selectedSourcePlanetId ? [selectedSourcePlanetId] : []);
+      if (sources.length === 0) { setAttackEstimate(null); return; }
+      // Total units sent equals the slider value; we split it across sources during launch
+      const totalUnits = Math.max(1, sendAmount);
+      // simple distance modifier average
+      let avgMod = 1;
+      try {
+        let sum = 0; let n = 0;
+        const toPos = getPlanetPosition(selectedPlanet.id) || [0,0,0];
+        sources.forEach(fromId => {
+          const fp = getPlanetPosition(fromId) || [0,0,0];
+          const dx = fp[0]-toPos[0], dy = fp[1]-toPos[1], dz = fp[2]-toPos[2];
+          const d = Math.sqrt(dx*dx+dy*dy+dz*dz);
+          const mod = Math.max(0.8, 1 - Math.min(0.5, d/80)); // cap distance penalty
+          sum += mod; n++;
+        });
+        avgMod = n ? sum/n : 1;
+      } catch {}
+      // Use server-authoritative leverage from context (fallback 1)
+      const leverage = Math.max(1, Number(leverageMultiplier) || 1);
+      const power = Math.floor(totalUnits * avgMod * leverage);
+      const defense = Math.max(1, Math.floor(((selectedPlanet.defense ?? 1) * 40)));
+      const ratio = power / defense;
+      const verdict: any = ratio >= 1.2 ? 'Win' : ratio >= 0.9 ? 'Close' : 'Unlikely';
+      if (!cancelled) setAttackEstimate({ power, defense, verdict });
+    };
+    calc();
+    return () => { cancelled = true; };
+  }, [selectedPlanet, selectedSourcePlanetIds, selectedSourcePlanetId, sendAmount, leverageSvc, world]);
+
+  // Listen for action events and trigger local FX at mapped positions
+  useEffect(() => {
+    const onAction = (e: any) => {
+      const detail = e?.detail;
+      if (!detail) return;
+      const position = idToPositionRef.current[detail.territoryId] || [0, 0, 0];
+      setActionEffect({ id: detail.territoryId, type: detail.action, position, start: performance.now() });
+      effectRef.current.life = 0;
+    };
+    window.addEventListener('territory-action', onAction as EventListener);
+    const onMoved = (e: any) => {
+      const d = e?.detail;
+      if (!d) return;
+      
+
+      
+      // Fallbacks if positions are missing from event
+      const fromPosObj = d.from_position || (() => { const p = getPlanetPosition(d.from_id || ''); return p ? { x: p[0], y: p[1], z: p[2] } : { x: 0, y: 0, z: 0 }; })();
+      const toPosObj = d.to_position || (() => { const p = getPlanetPosition(d.to_id || ''); return p ? { x: p[0], y: p[1], z: p[2] } : { x: 0, y: 0, z: 0 }; })();
+      const from: [number, number, number] = [fromPosObj.x, fromPosObj.y, fromPosObj.z];
+      const to: [number, number, number] = [toPosObj.x, toPosObj.y, toPosObj.z];
+      const count = Math.min(100, Math.max(10, Number(d.amount) || 20));
+      const dx = to[0]-from[0], dy = to[1]-from[1], dz = to[2]-from[2];
+      const dist = Math.max(0.001, Math.hypot(dx, dy, dz));
+      const dur = Math.max(Number(d.eta_ms) || 0, Math.min(30000, Math.max(12000, dist * 2600)));
+      const id = `${d.from_id}->${d.to_id}-${Date.now()}`;
+      
+      const flight = { 
+        id, 
+        start: performance.now(), 
+        durationMs: dur, 
+        from, 
+        to, 
+        count, 
+        owner: d.owner || playerId || 'player', 
+        fromId: d.from_id, 
+        toId: d.to_id, 
+        amount: Number(d.amount) || 0 
+      };
+      
+
+      setFlights(prev => {
+        // Check for duplicate flights (same route at similar time)
+        const isDuplicate = prev.some(f => 
+          f.fromId === flight.fromId && 
+          f.toId === flight.toId && 
+          Math.abs(f.start - flight.start) < 500 // Within 0.5 seconds
+        );
+        
+        if (isDuplicate) {
+          return prev;
+        }
+        
+        return [...prev, flight];
+      });
+
+      // Start local battle particles near target for continuous visual combat
+      try {
+        const attackers = Math.max(5, Math.floor((Number(d.amount) || 60) * 0.1));
+        let estDef = 40;
+        let defOwner = 'neutral';
+        try {
+          const g = (world?.galaxies || [])[0];
+          for (const s of (g?.systems || [])) {
+            const p = (s.planets || []).find((pp: any) => pp.id === d.to_id);
+            if (p) {
+              estDef = Math.max(20, Math.floor((p.defense ?? 1) * 40));
+              defOwner = p.controlledBy || 'neutral';
+              break;
+            }
+          }
+        } catch {}
+        
+        const battle: LocalBattle = {
+          id,
+          from,
+          to,
+          attackers: { count: attackers, owner: playerId || 'player' },
+          defenders: { count: estDef, owner: defOwner },
+          attackerParticles: [],
+          defenderParticles: [],
+          sparks: [],
+          createdAt: performance.now(),
+          lastUpdated: performance.now(),
+        } as any;
+        (battle as any).targetId = d.to_id;
+        battlesRef.current = [...battlesRef.current, battle];
+      } catch {}
+    };
+    window.addEventListener('units-moved', onMoved as EventListener);
+    return () => {
+      window.removeEventListener('territory-action', onAction as EventListener);
+      window.removeEventListener('units-moved', onMoved as EventListener);
+    };
+  }, []);
+
+  // Canvas child to animate camera toward focusTarget
+  const CameraManeuver: React.FC<{ target: [number, number, number] | null, onDone?: ()=>void }> = ({ target, onDone }) => {
+    const { camera } = useThree();
+    const anim = useRef<{ start: number; from: THREE.Vector3; to: THREE.Vector3; look: THREE.Vector3 } | null>(null);
+    useEffect(() => {
+      if (!target) return;
+      anim.current = {
+        start: performance.now(),
+        from: camera.position.clone(),
+        to: new THREE.Vector3(target[0] + 3, target[1] + 2, target[2] + 4),
+        look: new THREE.Vector3(target[0], target[1], target[2])
+      };
+    }, [target]);
+    useFrame(() => {
+      if (!anim.current) return;
+      const t = Math.min(1, (performance.now() - anim.current.start) / 800);
+      camera.position.lerpVectors(anim.current.from, anim.current.to, t);
+      camera.lookAt(anim.current.look);
+      if (t >= 1) { anim.current = null; if (onDone) onDone(); }
+    });
+    return null;
+  };
+
+  // Frame loop moved into EffectsLayer inside <Canvas>
+
+  const LocalBattles: React.FC = () => {
+    const attackerMeshRef = useRef<THREE.InstancedMesh>(null);
+    const defenderMeshRef = useRef<THREE.InstancedMesh>(null);
+    const sparkRef = useRef<THREE.InstancedMesh>(null);
+    const arenaRef = useRef<THREE.Points>(null);
+    const dummy = useMemo(() => new THREE.Object3D(), []);
+    const arenaParticles = useMemo(() => {
+      const temp = [];
+      for (let i = 0; i < 150; i++) { // reduced ambient
+        const theta = Math.random() * 2 * Math.PI;
+        const phi = Math.acos(2 * Math.random() - 1);
+        const r = ARENA_RADIUS * Math.cbrt(Math.random());
+        temp.push(new THREE.Vector3(r * Math.sin(phi) * Math.cos(theta), r * Math.sin(phi) * Math.sin(theta), r * Math.cos(phi)));
+      }
+      return temp;
+    }, []);
+
+    useFrame((_, delta) => {
+      if (!Array.isArray(battlesRef.current)) {
+        battlesRef.current = [];
+        return;
+      }
+      
+      const speedMul = Math.max(0.25, speed);
+      const now = performance.now();
+      const updated: LocalBattle[] = [];
+      if (arenaRef.current) {
+        let arenaIdx = 0;
+        const arenaPositions = (arenaRef.current.geometry.attributes.position as THREE.BufferAttribute).array as Float32Array;
+        for (const b of battlesRef.current) {
+          const progress = Math.max(0.0, Math.min(1.0, (now - b.createdAt) / 2500));
+          const maxAmbient = Math.floor(arenaParticles.length * (0.2 + 0.8 * progress));
+          for (let i = 0; i < maxAmbient; i++) {
+            const p = arenaParticles[i];
+            arenaPositions[arenaIdx * 3] = b.to[0] + p.x;
+            arenaPositions[arenaIdx * 3 + 1] = b.to[1] + p.y;
+            arenaPositions[arenaIdx * 3 + 2] = b.to[2] + p.z;
+            arenaIdx++;
+          }
+        }
+        arenaRef.current.geometry.attributes.position.needsUpdate = true;
+        (arenaRef.current as any).count = arenaIdx;
+      }
+
+      for (const b of battlesRef.current) {
+        const px = b.to[0], py = b.to[1], pz = b.to[2];
+        const progress = Math.max(0.0, Math.min(1.0, (now - b.createdAt) / 2500));
+        const spawnScale = Math.max(0.2, progress);
+
+        // Spawn new particles based on unit counts (ramped)
+        const attackerParticleCount = Math.floor((b.attackers.count / 10) * spawnScale);
+        if (attackerParticleCount > b.attackerParticles.length) {
+          for (let i = 0; i < (attackerParticleCount - b.attackerParticles.length); i++) {
+            const ox = (Math.random() - 0.5) * 1.2;
+            const oy = (Math.random() - 0.5) * 1.2;
+            const oz = (Math.random() - 0.5) * 1.2;
+            const dx = px - b.from[0], dy = py - b.from[1], dz = pz - b.from[2];
+            const len = Math.max(0.001, Math.hypot(dx, dy, dz));
+            const vx = (dx / len) * (0.006 + Math.random() * 0.012);
+            const vy = (dy / len) * (0.006 + Math.random() * 0.012);
+            const vz = (dz / len) * (0.006 + Math.random() * 0.012);
+            b.attackerParticles.push({ x: b.from[0] + ox, y: b.from[1] + oy, z: b.from[2] + oz, vx, vy, vz, life: 3.0, maxLife: 3.0 });
+          }
+        }
+        const defenderParticleCount = Math.floor((b.defenders.count / 10) * spawnScale);
+        if (defenderParticleCount > b.defenderParticles.length) {
+          for (let i = 0; i < (defenderParticleCount - b.defenderParticles.length); i++) {
+            const vx = (Math.random() - 0.5) * 0.02;
+            const vy = (Math.random() - 0.5) * 0.02;
+            const vz = (Math.random() - 0.5) * 0.02;
+            b.defenderParticles.push({ x: px + (Math.random()-0.5)*ARENA_RADIUS, y: py + (Math.random()-0.5)*ARENA_RADIUS, z: pz + (Math.random()-0.5)*ARENA_RADIUS, vx, vy, vz, life: 3.0, maxLife: 3.0 });
+          }
+        }
+
+        // Update attacker particles
+        b.attackerParticles = b.attackerParticles.filter(p => {
+          p.x += p.vx * 1000 * delta * speedMul;
+          p.y += p.vy * 1000 * delta * speedMul;
+          p.z += p.vz * 1000 * delta * speedMul;
+          p.life -= delta * 0.2 * speedMul;
+          const dx = p.x - px, dy = p.y - py, dz = p.z - pz;
+          if ((dx*dx + dy*dy + dz*dz) < 1.2) {
+            b.defenders.count = Math.max(0, b.defenders.count - 1);
+            const sparkChance = 0.002 + 0.008 * progress; // ramp sparks
+            if (Math.random() < sparkChance) {
+            b.sparks.push({ x: p.x, y: p.y, z: p.z, vx: (Math.random()-0.5)*0.04, vy: (Math.random()-0.5)*0.04, vz: (Math.random()-0.5)*0.04, life: 0.6, maxLife: 0.6 });
+            }
+            return false;
+          }
+          return p.life > 0;
+        });
+
+        // Update defender particles
+        b.defenderParticles = b.defenderParticles.filter(p => {
+          p.x += p.vx * 1000 * delta * speedMul;
+          p.y += p.vy * 1000 * delta * speedMul;
+          p.z += p.vz * 1000 * delta * speedMul;
+          p.life -= delta * 0.2 * speedMul;
+          const dx = p.x - px, dy = p.y - py, dz = p.z - pz;
+          if ((dx*dx + dy*dy + dz*dz) > (ARENA_RADIUS * 1.1)**2) {
+            p.vx *= -1; p.vy *= -1; p.vz *= -1;
+          }
+          const sparkChance = 0.002 + 0.008 * progress;
+          if (Math.random() < sparkChance) {
+            b.sparks.push({ x: p.x, y: p.y, z: p.z, vx: (Math.random()-0.5)*0.04, vy: (Math.random()-0.5)*0.04, vz: (Math.random()-0.5)*0.04, life: 0.6, maxLife: 0.6 });
+          }
+          return p.life > 0;
+        });
+
+        b.sparks = b.sparks.filter(s => {
+          s.x += s.vx * 1000 * delta * speedMul;
+          s.y += s.vy * 1000 * delta * speedMul;
+          s.z += s.vz * 1000 * delta * speedMul;
+          s.life -= delta * 0.7 * speedMul;
+          return s.life > 0;
+        });
+
+        // Continuous attrition model
+        if (now - b.lastUpdated > 500) {
+          const attackerLoss = Math.floor((b.defenders.count / 50) * Math.random() * 5);
+          const defenderLoss = Math.floor((b.attackers.count / 60) * Math.random() * 8);
+          b.attackers.count = Math.max(0, b.attackers.count - attackerLoss);
+          b.defenders.count = Math.max(0, b.defenders.count - defenderLoss);
+          b.lastUpdated = now;
+
+          // Trim particle arrays to match counts (respect spawnScale)
+          b.attackerParticles.length = Math.floor((b.attackers.count / 10) * spawnScale);
+          b.defenderParticles.length = Math.floor((b.defenders.count / 10) * spawnScale);
+
+          // Victory condition check
+          if (b.defenders.count <= 0 || (b.attackers.count <= 0 && b.attackerParticles.length === 0)) {
+            const outcome = b.defenders.count <= 0 ? 'attack' : 'defend';
+            setActionEffect({ id: `battle-${b.id}`, type: outcome, position: [px, py, pz], start: performance.now() });
+          } else {
+            updated.push(b);
+          }
+        } else {
+          updated.push(b);
+        }
+      }
+      battlesRef.current = updated;
+
+      if (attackerMeshRef.current) {
+        const inst = attackerMeshRef.current;
+        let idx = 0;
+        for (const b of battlesRef.current) {
+          if (b && Array.isArray(b.attackerParticles)) {
+          for (const p of b.attackerParticles) {
+              if (p && typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number') {
+            dummy.position.set(p.x, p.y, p.z);
+            const s = 0.05;
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            inst.setMatrixAt(idx++, dummy.matrix);
+              }
+            }
+          }
+        }
+        inst.count = idx;
+        inst.instanceMatrix.needsUpdate = true;
+      }
+      if (defenderMeshRef.current) {
+        const inst = defenderMeshRef.current;
+        let idx = 0;
+        for (const b of battlesRef.current) {
+          if (b && Array.isArray(b.defenderParticles)) {
+          for (const p of b.defenderParticles) {
+              if (p && typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number') {
+            dummy.position.set(p.x, p.y, p.z);
+            const s = 0.05;
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            inst.setMatrixAt(idx++, dummy.matrix);
+              }
+            }
+          }
+        }
+        inst.count = idx;
+        inst.instanceMatrix.needsUpdate = true;
+      }
+      if (sparkRef.current) {
+        const inst = sparkRef.current;
+        let idx = 0;
+        for (const b of battlesRef.current) {
+          if (b && Array.isArray(b.sparks)) {
+          for (const p of b.sparks) {
+              if (p && typeof p.x === 'number' && typeof p.y === 'number' && typeof p.z === 'number' && 
+                  typeof p.life === 'number' && typeof p.maxLife === 'number') {
+            dummy.position.set(p.x, p.y, p.z);
+            const s = 0.04 + (p.life / p.maxLife) * 0.06;
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            inst.setMatrixAt(idx++, dummy.matrix);
+              }
+            }
+          }
+        }
+        inst.count = idx;
+        inst.instanceMatrix.needsUpdate = true;
+      }
+    });
+    return (
+      <group>
+        <instancedMesh ref={attackerMeshRef} args={[undefined as any, undefined as any, 400]}>
+          <sphereGeometry args={[1, 8, 8]} />
+          <meshBasicMaterial color="#66ff66" transparent opacity={0.95} blending={THREE.AdditiveBlending} />
+        </instancedMesh>
+        <instancedMesh ref={defenderMeshRef} args={[undefined as any, undefined as any, 400]}>
+          <sphereGeometry args={[1, 8, 8]} />
+          <meshBasicMaterial color="#ff6666" transparent opacity={0.95} blending={THREE.AdditiveBlending} />
+        </instancedMesh>
+        <instancedMesh ref={sparkRef} args={[undefined as any, undefined as any, 400]}>
+          <sphereGeometry args={[0.6, 8, 8]} />
+          <meshBasicMaterial color="#ffee88" transparent opacity={0.9} blending={THREE.AdditiveBlending} />
+        </instancedMesh>
+        <points ref={arenaRef}>
+          <bufferGeometry>
+            <bufferAttribute
+              attach="attributes-position"
+              count={150 * 5}
+              array={new Float32Array(150 * 5 * 3)}
+              itemSize={3}
+            />
+          </bufferGeometry>
+          <pointsMaterial color="#ff8844" size={0.05} transparent opacity={0.35} blending={THREE.AdditiveBlending} />
+        </points>
+        {/* Live counters overlay */}
+        {battlesRef.current.map(b => (
+          <Html key={`counter-${b.id}`} position={[b.to[0], b.to[1] + 1.1, b.to[2]]} center style={{ pointerEvents:'none' }}>
+            <div style={{background:'rgba(0,0,0,0.55)',border:'1px solid rgba(255,255,255,0.2)',borderRadius:4,padding:'2px 6px',fontSize:12,color:'#cfe9ff'}}>
+              Attackers: {b.attackers.count} • Defenders: {b.defenders.count}
+            </div>
+          </Html>
+        ))}
+      </group>
+    );
+  };
+
+  const handleTerritoryClick = (territoryId: string, position: [number, number, number]) => {
+    // setSelectedTerritory(territoryId);
+    setCameraTarget(position);
+    
+    // Send territory selection to backend
+    sendMessage({
+      type: 'territory_action',
+      territory_id: territoryId,
+      action: 'select'
+    });
+  };
+
+  // const handleTerritoryAction = (territoryId: string, action: string) => {
+  //   sendMessage({
+  //     type: 'territory_action',
+  //     territory_id: territoryId,
+  //     action: action
+  //   });
+  // };
+
+  // Create demo territories if none exist - memoized to prevent flashing
+  const demoTerritories = useMemo(() => territories.length > 0 ? territories : [
+    {
+      id: 'alpha-sector',
+      name: 'Alpha Sector',
+      controlled: false,
+      defense: 0,
+      resources: [
+        { type: 'Energy', amount: 150 },
+        { type: 'Minerals', amount: 200 }
+      ]
+    },
+    {
+      id: 'beta-quadrant',
+      name: 'Beta Quadrant',
+      controlled: true,
+      defense: 3,
+      resources: [
+        { type: 'Crystals', amount: 75 },
+        { type: 'Gas', amount: 300 }
+      ]
+    },
+    {
+      id: 'gamma-zone',
+      name: 'Gamma Zone',
+      controlled: false,
+      defense: 1,
+      resources: [
+        { type: 'Energy', amount: 100 },
+        { type: 'Crystals', amount: 50 }
+      ]
+    },
+    {
+      id: 'delta-region',
+      name: 'Delta Region',
+      controlled: false,
+      defense: 2,
+      resources: [
+        { type: 'Minerals', amount: 400 },
+        { type: 'Energy', amount: 250 }
+      ]
+    },
+    {
+      id: 'epsilon-field',
+      name: 'Epsilon Field',
+      controlled: true,
+      defense: 5,
+      resources: [
+        { type: 'Gas', amount: 500 },
+        { type: 'Crystals', amount: 150 }
+      ]
+    }
+  ], [territories]);
+
+  // Debug logging removed to prevent render spam
+
+  // Memory management to prevent context loss (less aggressive in dev mode)
+  useEffect(() => {
+    const isDevelopment = import.meta.env.DEV || process.env.NODE_ENV === 'development';
+    const cleanupInterval = isDevelopment ? 30000 : 1000; // 30s in dev, 1s in prod
+    
+    const memoryCleanupInterval = setInterval(() => {
+      // Cleanup (less aggressive in development)
+      setActiveBeams([]);
+      setFlights([]);
+      setActionNotifications([]);
+      setActionEffect(null);
+      
+      // Force garbage collection (only in production)
+      if (!isDevelopment && (window as any).gc) {
+        (window as any).gc();
+      }
+    }, cleanupInterval);
+
+    return () => {
+      clearInterval(memoryCleanupInterval);
+    };
+  }, []);
+
+  // WebGL cleanup on component unmount (especially important for HMR)
+  useEffect(() => {
+    return () => {
+      // Clean up WebGL context on component unmount
+      if (globalWebGLRenderer && typeof globalWebGLRenderer.dispose === 'function') {
+        console.log('[DEV] Disposing WebGL renderer on component unmount');
+        try {
+          globalWebGLRenderer.dispose();
+          globalWebGLRenderer = null;
+        } catch (error) {
+          console.warn('Error disposing WebGL renderer:', error);
+        }
+      }
+    };
+  }, []);
+
+  // Track HMR updates and disable WebGL temporarily
+  useEffect(() => {
+    if (isDevelopment) {
+      const newCount = hmrCount + 1;
+      setHmrCount(newCount);
+      globalHmrCount = newCount;
+      console.log(`[DEV] HMR update count: ${newCount}`);
+      
+      // Reset HMR count after a period of stability
+      const resetTimer = setTimeout(() => {
+        setHmrCount(0);
+        globalHmrCount = 0;
+        console.log('[DEV] Resetting HMR count - stable period detected');
+      }, 30000); // Reset after 30 seconds of stability
+
+      return () => clearTimeout(resetTimer);
+    }
+  }, [hmrCount, isDevelopment]);
+
+  // Development mode: Periodic canvas refresh to prevent context accumulation
+  useEffect(() => {
+    if (import.meta.env.DEV && !skipWebGL) {
+      const refreshInterval = setInterval(() => {
+        if (globalContextLossCount > 2) {
+          console.log('[DEV] Refreshing canvas to prevent context issues');
+          setCanvasKey(prev => prev + 1);
+          globalContextLossCount = 0; // Reset after refresh
+        }
+      }, 15000); // Every 15 seconds
+
+      return () => clearInterval(refreshInterval);
+    }
+  }, [canvasKey, skipWebGL]);
+
+  // Error Boundary for the entire Canvas
+  const WebGLErrorBoundary: React.FC<{ children: React.ReactNode }> = ({ children }) => {
+    const [hasError, setHasError] = useState(false);
+
+    useEffect(() => {
+      const handleError = (e: ErrorEvent) => {
+        if (e.message?.includes('WebGL') || e.message?.includes('EffectComposer') || e.message?.includes('alpha')) {
+          console.error('WebGL Error caught by boundary:', e.message);
+          setHasError(true);
+          e.preventDefault();
+        }
+      };
+
+      window.addEventListener('error', handleError);
+      return () => window.removeEventListener('error', handleError);
+    }, []);
+
+    if (hasError) {
+  return (
+        <div style={{
+          position: 'absolute',
+          top: '50%',
+          left: '50%',
+          transform: 'translate(-50%, -50%)',
+          color: 'white',
+          textAlign: 'center',
+          background: 'rgba(0, 0, 0, 0.8)',
+          padding: '20px',
+          borderRadius: '8px',
+          border: '2px solid #ff4444'
+        }}>
+          <h3>🚧 WebGL Rendering Issue</h3>
+          <p>The 3D graphics engine encountered repeated context loss.</p>
+          <p style={{ fontSize: '14px', opacity: 0.8 }}>This may be due to GPU memory limitations.</p>
+          <div style={{ marginTop: '15px' }}>
+            <button 
+              onClick={() => {
+                setHasError(false);
+                localStorage.setItem('webgl_safe_mode', 'true');
+                window.location.reload();
+              }} 
+              style={{
+                background: '#27ae60',
+                color: 'white',
+                border: 'none',
+                padding: '10px 20px',
+                borderRadius: '4px',
+                cursor: 'pointer',
+                marginRight: '10px'
+              }}
+            >
+              🔧 Safe Mode
+            </button>
+            <button 
+              onClick={() => window.location.reload()} 
+              style={{
+                background: '#44aa66',
+                color: 'white',
+                border: 'none',
+                padding: '10px 20px',
+                borderRadius: '4px',
+                cursor: 'pointer'
+              }}
+            >
+              🔄 Reload Game
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return <>{children}</>;
+  };
+
+  // Development mode: Skip WebGL during active HMR to prevent context accumulation
+  if (skipWebGL) {
+    return (
+      <div className="game-world" style={{
+        position: 'relative', 
+        width: '100vw', 
+        height: '100vh', 
+        zIndex: 1,
+        background: 'linear-gradient(135deg, #001122, #003344)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexDirection: 'column',
+        color: '#ffffff'
+      }}>
+        <div style={{
+          background: 'rgba(0, 60, 120, 0.9)',
+          border: '2px solid #66aaff',
+          borderRadius: '10px',
+          padding: '20px',
+          textAlign: 'center',
+          maxWidth: '500px'
+        }}>
+          <h3 style={{color: '#66aaff', marginBottom: '15px'}}>🔧 Development Mode</h3>
+          <p style={{marginBottom: '15px', lineHeight: 1.4}}>
+            WebGL temporarily disabled during Hot Module Reloading to prevent context conflicts.
+          </p>
+          <p style={{fontSize: '14px', opacity: 0.8}}>
+            HMR Updates: {hmrCount}/5 - Game will resume automatically after edits stabilize.
+          </p>
+          <button 
+            onClick={() => {
+              setHmrCount(0);
+              setCanvasKey(prev => prev + 1);
+            }}
+            style={{
+              background: '#44aa44',
+              color: 'white',
+              border: 'none',
+              padding: '8px 16px',
+              borderRadius: '4px',
+              cursor: 'pointer',
+              marginTop: '10px'
+            }}
+          >
+            🔄 Force Resume
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Safe mode fallback UI
+  if (safeMode) {
+    return (
+      <div className="game-world" style={{
+        position: 'relative', 
+        width: '100vw', 
+        height: '100vh', 
+        zIndex: 1,
+        background: 'linear-gradient(135deg, #001122, #003344)',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        flexDirection: 'column',
+        color: '#ffffff'
+      }}>
+        <div style={{
+          background: 'rgba(0, 20, 40, 0.95)',
+          border: '3px solid #66aaff',
+          borderRadius: '15px',
+          padding: '40px',
+          textAlign: 'center',
+          maxWidth: '600px'
+        }}>
+          <h2 style={{color: '#66aaff', marginBottom: '20px'}}>🛡️ Safe Mode Active</h2>
+          <p style={{marginBottom: '20px', lineHeight: 1.6}}>
+            The game is running in safe mode due to WebGL context issues. 
+            Your GPU may be experiencing memory limitations.
+          </p>
+          <div style={{display: 'flex', gap: '15px', justifyContent: 'center'}}>
+            <button 
+              onClick={() => {
+                localStorage.removeItem('webgl_safe_mode');
+                globalContextLossCount = 0; // Reset global counter
+                window.location.reload();
+              }}
+              style={{
+                background: '#44aa44',
+                color: 'white',
+                border: 'none',
+                padding: '12px 24px',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '16px'
+              }}
+            >
+              🔄 Try Again
+            </button>
+            <button 
+              onClick={() => {
+                localStorage.setItem('webgl_safe_mode', 'permanent');
+                window.location.reload();
+              }}
+              style={{
+                background: '#aa4444',
+                color: 'white',
+                border: 'none',
+                padding: '12px 24px',
+                borderRadius: '6px',
+                cursor: 'pointer',
+                fontSize: '16px'
+              }}
+            >
+              🚫 Stay in Safe Mode
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  // Determine which renderer to use
+  const renderMode = USE_SIMPLE_RENDERER || useSimpleRenderer ? 'simple' : 'webgl';
+
+  // Return the appropriate UI based on the current mode
+  return (
+    <div className="game-world" style={{position: 'relative', width: '100vw', height: '100vh', zIndex: 1}}>
+      {/* Dev Controls */}
+      {isDevelopment && (
+        <div style={{
+          position: 'fixed',
+          top: '10px',
+          right: '10px',
+          zIndex: 9999,
+          display: 'flex',
+          gap: '10px'
+        }}>
+          <button
+            onClick={() => setUseSimpleRenderer(!useSimpleRenderer)}
+            style={{
+              background: useSimpleRenderer ? '#44aa44' : '#aa4444',
+              color: 'white',
+              border: 'none',
+              padding: '8px 16px',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            {useSimpleRenderer ? '🎮 Enable 3D' : '🔧 Simple Mode'}
+          </button>
+          <button
+            onClick={() => setCanvasKey(k => k + 1)}
+            style={{
+              background: '#4444aa',
+              color: 'white',
+              border: 'none',
+              padding: '8px 16px',
+              borderRadius: '4px',
+              cursor: 'pointer'
+            }}
+          >
+            🔄 Reset Canvas
+          </button>
+        </div>
+      )}
+      
+      {/* Simple Mode Renderer */}
+      {renderMode === 'simple' && (
+        <SimpleRenderer>
+          <div style={{
+            display: 'flex',
+            flexDirection: 'column',
+            alignItems: 'center',
+            gap: '20px'
+          }}>
+            <h2>Game World</h2>
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(3, 1fr)',
+              gap: '15px',
+              padding: '20px',
+              background: 'rgba(0,0,0,0.3)',
+              borderRadius: '8px'
+            }}>
+              {territories.map((t: any, _i: number) => (
+                <div key={t.id} style={{
+                  padding: '10px',
+                  background: t.controlled ? 'rgba(0,255,0,0.1)' : 'rgba(255,0,0,0.1)',
+                  border: '1px solid ' + (t.controlled ? '#44ff44' : '#ff4444'),
+                  borderRadius: '4px',
+                  textAlign: 'center'
+                }}>
+                  {t.name}
+                </div>
+              ))}
+            </div>
+          </div>
+        </SimpleRenderer>
+      )}
+      
+      {/* WebGL Mode Renderer - Simplified for stability */}
+      {renderMode === 'webgl' && (
+        <div>
+          <Canvas 
+            camera={{ position: [0, 70, 0], fov: 75 }} 
+            onCreated={({ camera, gl }) => { 
+              (window as any).__r3f_cam__ = camera;
+              globalWebGLRenderer = gl;
+          
+          // WebGL context loss prevention
+          const canvas = gl.domElement;
+          
+          // Better WebGL context management - prevent infinite loops
+          canvas.addEventListener('webglcontextlost', (e) => {
+            globalContextLossCount++;
+            console.warn(`WebGL context lost (${globalContextLossCount}/${MAX_CONTEXT_LOSS}) - preventing default`);
+            e.preventDefault();
+            
+            // Clear any existing animation frames to prevent loops
+            if ((window as any).gameAnimationFrame) {
+              cancelAnimationFrame((window as any).gameAnimationFrame);
+            }
+            
+            // In development mode, be more lenient (HMR causes context loss)
+            const isDevelopment = import.meta.env.DEV || process.env.NODE_ENV === 'development';
+            
+            if (isDevelopment) {
+              // In development, just log and prevent default but don't count toward safe mode
+              console.log(`[DEV] WebGL context lost during development (${globalContextLossCount}) - HMR expected`);
+              // Reset count more aggressively in dev mode to prevent accumulation
+              setTimeout(() => {
+                globalContextLossCount = Math.max(0, globalContextLossCount - 1);
+              }, 2000);
+              return false;
+            }
+            
+            // Production mode - be strict about context losses
+            if (globalContextLossCount >= MAX_CONTEXT_LOSS) {
+              console.error(`Too many WebGL context losses (${globalContextLossCount}), triggering safe mode`);
+              localStorage.setItem('webgl_safe_mode', 'true');
+              window.location.reload();
+              return false;
+            }
+            
+            return false;
+          });
+          
+          // Context restoration handler
+          canvas.addEventListener('webglcontextrestored', () => {
+            console.log('WebGL context restored successfully');
+            // In development, be more forgiving with context restoration
+            const isDevelopment = import.meta.env.DEV || process.env.NODE_ENV === 'development';
+            if (isDevelopment) {
+              // Reset count more aggressively in dev mode (HMR is expected)
+              globalContextLossCount = Math.max(0, globalContextLossCount - 2);
+            } else {
+              // Only reduce count if we had losses, but keep some memory of instability
+              if (globalContextLossCount > 0) {
+                globalContextLossCount = Math.max(1, globalContextLossCount - 1);
+              }
+            }
+          });
+          
+
+        }} 
+        onPointerMissed={() => setSelectedPlanet(null)}
+        gl={{ 
+          alpha: false,
+          antialias: false,
+          depth: true,
+          stencil: false,
+          powerPreference: "low-power",
+          preserveDrawingBuffer: false,
+          failIfMajorPerformanceCaveat: true
+        }}
+        dpr={Math.min(1, window.devicePixelRatio || 1)} // Conservative DPR
+        performance={{ min: 0.5 }} // Lower performance threshold
+      >
+        <OrbitControls 
+          target={cameraTarget}
+          enablePan={true}
+          enableZoom={true}
+          enableRotate={true}
+          minDistance={3}
+          maxDistance={120}
+          makeDefault
+        />
+        
+        {/* Lighting setup */}
+        <ambientLight intensity={0.4} />
+        <pointLight position={[10, 10, 10]} intensity={1.5} color="#ffffff" />
+        <pointLight position={[-10, -10, -10]} intensity={0.8} color="#4444ff" />
+        <pointLight position={[0, 20, 0]} intensity={1.2} color="#ffff44" />
+        
+
+        
+        <Suspense fallback={<Html center>Loading Universe...</Html>}>
+          {/* Adaptive lighting based on performance mode */}
+          <ambientLight intensity={performanceMode >= 2 ? 0.8 : 0.4} />
+          <directionalLight position={[10, 10, 5]} intensity={performanceMode >= 2 ? 1.2 : 1} />
+
+
+          
+          {/* Minimal stars only */}
+          <Stars
+            radius={50}
+            depth={20}
+            count={200}
+            factor={1}
+            saturation={0}
+            fade={false}
+            speed={0.1}
+          />
+
+          {/* Central Hub hidden in galaxy view; sector view demo keeps it */}
+          {!galaxyView && (
+            <group>
+              <mesh position={[0, 0, 0]}>
+                <sphereGeometry args={[1, 32, 32]} />
+                <meshStandardMaterial 
+                  color="#ffff00" 
+                  emissive="#ffff00" 
+                  emissiveIntensity={0.5}
+                />
+              </mesh>
+              <Text position={[0, 2, 0]} fontSize={1} color="#ffffff" anchorX="center" anchorY="middle">HoneyComb Protocol</Text>
+              <Text position={[0, -2, 0]} fontSize={0.5} color="#aaaaaa" anchorX="center" anchorY="middle">Central Command Hub</Text>
+            </group>
+          )}
+          
+          {/* Basic fallback scene when no content */}
+          {(!demoTerritories || demoTerritories.length === 0) && (
+            <group>
+              <mesh position={[0, 0, 0]}>
+                <sphereGeometry args={[2, 32, 32]} />
+                <meshStandardMaterial color="#4CAF50" />
+              </mesh>
+              <Text position={[0, 3, 0]} fontSize={1} color="#ffffff" anchorX="center" anchorY="middle">
+                HoneyComb Protocol
+              </Text>
+              <Text position={[0, -3, 0]} fontSize={0.5} color="#aaaaaa" anchorX="center" anchorY="middle">
+                Loading game world...
+              </Text>
+            </group>
+          )}
+
+          {/* Territories / Planets - Always show some content, even in safe mode */}
+          {(demoTerritories || []).map((territory: any, index: number) => {
+            const position = territoryPositions[index] || [
+              Math.random() * 20 - 10,
+              Math.random() * 4 - 2,
+              Math.random() * 20 - 10
+            ];
+            // Update id->position map for effects
+            idToPositionRef.current[territory.id] = position as [number, number, number];
+            
+            return (
+              <group key={territory.id}>
+              <Territory
+                id={territory.id}
+                position={position as [number, number, number]}
+                scale={territory.controlled ? 1.5 : 1}
+                resources={territory.resources || []}
+                controlled={territory.controlled || false}
+                defense={territory.defense || 0}
+                onClick={() => handleTerritoryClick(territory.id, position as [number, number, number])}
+              />
+                {/* Eufloria-inspired visuals */}
+                {/* Temporarily disable all particle effects */}
+              </group>
+            );
+          })}
+
+          {/* Resource nodes */}
+          {resources?.map((resource: any, index: number) => (
+            <Resource
+              key={`resource-${index}`}
+              type={resource.type}
+              amount={resource.amount}
+              position={[
+                Math.random() * 30 - 15,
+                Math.random() * 4 - 2,
+                Math.random() * 30 - 15
+              ]}
+            />
+          ))}
+
+          {/* Connection lines between territories - Only show in full performance mode */}
+          {(performanceMode === 0 && !galaxyView ? demoTerritories : []).map((territory: any, index: number) => {
+            if (!territory.controlled) return null;
+            
+            const currentPos = territoryPositions[index] || [0, 0, 0];
+            const nextControlled = demoTerritories.find((t: any, i: number) => 
+              i > index && t.controlled
+            );
+            
+            if (nextControlled) {
+              const nextIndex = demoTerritories.indexOf(nextControlled);
+              const nextPos = territoryPositions[nextIndex] || [0, 0, 0];
+              
+              return (
+                <line key={`connection-${index}`}>
+                  <bufferGeometry>
+                    <bufferAttribute
+                      attach="attributes-position"
+                      count={2}
+                      array={new Float32Array([
+                        currentPos[0], currentPos[1], currentPos[2],
+                        nextPos[0], nextPos[1], nextPos[2]
+                      ])}
+                      itemSize={3}
+                    />
+                  </bufferGeometry>
+                  <lineBasicMaterial color="#00ff00" opacity={0.6} transparent />
+                </line>
+              );
+            }
+            return null;
+          })}
+
+          {/* Galaxy view rendering */}
+          {galaxyView && world && (
+            <group>
+              {world.galaxies?.[0]?.systems?.map((sys: any, si: number) => {
+                const sPos: [number, number, number] = [sys.position.x, sys.position.y, sys.position.z];
+                return (
+                  <group key={sys.id}>
+                    {/* Sun */}
+                    <mesh ref={si === 0 ? sunRef : null} position={sPos}>
+                      <sphereGeometry args={[1.2, 32, 32]} />
+                      <meshStandardMaterial color={sys.sun?.color || '#ffff66'} emissive={sys.sun?.color || '#ffff66'} emissiveIntensity={sys.sun?.intensity || 1.0} />
+                    </mesh>
+                      <Text position={[sPos[0], sPos[1] + 2, sPos[2]]} fontSize={0.6} color="#ffffff" anchorX="center" anchorY="middle"
+                      onClick={() => setFocusTarget(sPos)}>{sys.id}</Text>
+                    {/* Planets */}
+                    {sys.planets?.map((p: any) => {
+                      const pp: [number, number, number] = [p.position.x, p.position.y, p.position.z];
+                      idToPositionRef.current[p.id] = pp;
+                      const isFriendly = !!p.controlledBy && isFriendlyOwner(p.controlledBy);
+                      const isEnemy = !!p.controlledBy && !isFriendly;
+                      const power = Math.max(0, Math.min(1, (p.defense ?? 0) / 10));
+                      return (
+                        <group key={p.id}>
+                          <mesh
+                            position={pp}
+                            onPointerOver={() => setHoveredPlanet(p)}
+                            onPointerOut={() => setHoveredPlanet((cur: any) => (cur?.id === p.id ? null : cur))}
+                            onClick={(e) => {
+                            e.stopPropagation();
+                            // setSelectedTerritory(p.id);
+                            setSelectedPlanet(p);
+                            // Default source to nearest friendly when opening panel on a target
+                            try {
+                              const nearest = getNearestFriendlyPlanet(p.id);
+                              if (nearest) setSelectedSourcePlanetId(nearest.id);
+                            } catch {}
+                            setFocusTarget(pp);
+                            setCameraTarget(pp);
+                            }}
+                          >
+                            <sphereGeometry args={[0.3, 16, 16]} />
+                            <meshStandardMaterial
+                              color={p.controlledBy ? (isEnemy ? '#ff6666' : '#66ff66') : '#66aaff'}
+                              emissive={(selectedPlanet?.id === p.id || hoveredPlanet?.id === p.id) ? '#88ccff' : '#112233'}
+                              emissiveIntensity={(selectedPlanet?.id === p.id || hoveredPlanet?.id === p.id) ? 1.0 : 0.2}
+                            />
+                          </mesh>
+                            {/* Pulsing Atmosphere */}
+                            <mesh position={pp}>
+                              <sphereGeometry args={[0.4, 32, 32]} />
+                              <meshStandardMaterial
+                                color={isEnemy ? '#ff6666' : (isFriendly ? '#66ff66' : '#66aaff')}
+                                transparent
+                                opacity={0.2 + Math.sin(Date.now() * 0.001) * 0.1}
+                                blending={THREE.AdditiveBlending}
+                              />
+                            </mesh>
+                            {/* Population/Defense ring */}
+                            <mesh position={pp} rotation={[-Math.PI / 2, 0, 0]}>
+                              <ringGeometry args={[0.55, 0.56, 64]} />
+                              <meshBasicMaterial color={isEnemy ? '#ff7777' : '#77ff99'} transparent opacity={0.8} />
+                            </mesh>
+                            {/* Power rings show planet strength/defense */}
+                             <mesh position={pp} rotation={[-Math.PI / 2, 0, 0]}>
+                              <ringGeometry args={[0.56, 0.56 + power * 1.0, 64]} />
+                              <meshBasicMaterial color={isEnemy ? '#ff4444' : '#44ffaa'} transparent opacity={0.6} />
+                            </mesh>
+                            <mesh position={pp} rotation={[-Math.PI / 2, 0, 0]}>
+                              <ringGeometry args={[0.56 + power * 1.0 + 0.02, 0.56 + power * 1.0 + 0.08, 64]} />
+                              <meshBasicMaterial color={isEnemy ? '#ff9999' : '#99ffcc'} transparent opacity={0.35} />
+                            </mesh>
+                            {/* Aura glow scales with power */}
+                            <mesh position={pp}>
+                              <sphereGeometry args={[0.35 + power * 0.4, 16, 16]} />
+                              <meshBasicMaterial color={isEnemy ? '#ff6666' : '#66ffcc'} transparent opacity={0.12 + power * 0.18} blending={THREE.AdditiveBlending} />
+                            </mesh>
+                          {isFriendly && (
+                            <Text position={[pp[0], pp[1] + 0.6, pp[2]]} fontSize={0.28} color="#aaffaa" anchorX="center" anchorY="middle">Home</Text>
+                          )}
+                          {/* Temporarily disable satellites and defense rings */}
+                          {(selectedPlanet?.id === p.id || hoveredPlanet?.id === p.id) && (
+                            <mesh position={pp} rotation={[-Math.PI / 2, 0, 0]}>
+                              <ringGeometry args={[0.42, 0.5, 48]} />
+                              <meshBasicMaterial color="#88ccff" transparent opacity={0.85} />
+                            </mesh>
+                          )}
+                          {(hoveredPlanet?.id === p.id) && (
+                            <Html position={[pp[0], pp[1] + 0.9, pp[2]]} center style={{ pointerEvents: 'none' }}>
+                              <div style={{
+                                background:'rgba(0,20,40,0.9)',border:'1px solid #88ccff',borderRadius:6,padding:'8px 10px',color:'#cfe9ff',
+                                fontSize:12,boxShadow:'0 0 12px rgba(136,204,255,0.25)'
+                              }}>
+                                <div style={{color:'#9bd4ff',fontWeight:700,marginBottom:4}}>{p.name}</div>
+                                <div>Owner: {p.controlledBy || 'Unclaimed'}</div>
+                                <div>Defense: {p.defense ?? 0}</div>
+                                <div style={{marginTop:4}}>Resources: {(p.resources||[]).map((r:any)=>`${r.type}:${r.amount}`).join(', ') || 'None'}</div>
+                              </div>
+                            </Html>
+                          )}
+                          {/* Temporarily disable orbit swarm */}
+                        </group>
+                      );
+                    })}
+                  </group>
+                );
+              })}
+            </group>
+          )}
+
+          {/* Temporarily disable effects layer and unit flights */}
+          {/* Temporarily disable battles and beams */}
+          {/* Pre-attack arc previews from selected sources to target */}
+          {(selectedPlanet && galaxyView) && (
+            <group>
+              {((selectedSourcePlanetIds && selectedSourcePlanetIds.length>0) ? selectedSourcePlanetIds : (selectedSourcePlanetId ? [selectedSourcePlanetId] : [])).map((fromId) => {
+                const sp = getPlanetPosition(fromId || '') || null;
+                const tp = getPlanetPosition(selectedPlanet.id) || null;
+                if (!sp || !tp) return null;
+                const pts = new Float32Array([ sp[0], sp[1], sp[2], tp[0], tp[1], tp[2] ]);
+                return (
+                  <line key={`preview-${fromId}`}>
+                    <bufferGeometry>
+                      <bufferAttribute attach="attributes-position" count={2} array={pts} itemSize={3} />
+                    </bufferGeometry>
+                    <lineDashedMaterial color="#66ff66" dashSize={0.2} gapSize={0.15} transparent opacity={0.5} />
+                  </line>
+                );
+              })}
+            </group>
+          )}
+          <CameraManeuver target={focusTarget} onDone={() => {
+            // After auto-zoom completes, allow user to adjust freely via OrbitControls constraints
+          }} />
+          {/* Temporarily disable post-processing */}
+        </Suspense>
+      </Canvas>
+      </WebGLErrorBoundary>
+      )}
+
+      {/* Resource HUD - Only in WebGL mode */}
+      {renderMode === 'webgl' && (
+        <div style={{position:'absolute', top:10, left:10, display:'flex', gap:10, zIndex:1002}}>
+          <div className="info-panel" style={{
+            background:'rgba(0,15,30,0.9)', 
+            padding:'12px 15px', 
+            border:'2px solid #66aaff', 
+            borderRadius:8, 
+            color:'#cfe9ff',
+            boxShadow: '0 0 15px rgba(102, 170, 255, 0.3)',
+            backdropFilter: 'blur(4px)',
+            minWidth: '140px'
+          }}>
+          <div style={{fontWeight:700, marginBottom:8, color:'#88ccff', fontSize:'14px', textAlign:'center'}}>💎 Resources</div>
+          <div style={{display:'flex', alignItems:'center', marginBottom:6}}>
+            <span style={{fontSize:'16px', marginRight:'6px'}}>⚡</span>
+            <div>
+              <div style={{fontSize:'13px', fontWeight:'bold', color:'#ffaa44'}}>Energy: {Math.floor(stockpile.energy)}</div>
+              <div style={{fontSize:'10px', opacity:0.7}}>For research & upgrades</div>
+            </div>
+          </div>
+          <div style={{display:'flex', alignItems:'center'}}>
+            <span style={{fontSize:'16px', marginRight:'6px'}}>🔷</span>
+            <div>
+              <div style={{fontSize:'13px', fontWeight:'bold', color:'#88aaff'}}>Minerals: {Math.floor(stockpile.minerals)}</div>
+              <div style={{fontSize:'10px', opacity:0.7}}>For satellite defenses</div>
+            </div>
+          </div>
+          <div style={{fontSize:'9px', opacity:0.6, marginTop:'6px', textAlign:'center', borderTop:'1px solid #335', paddingTop:'4px'}}>
+            💡 Harvest planets to gather resources
+          </div>
+        </div>
+        <div className="info-panel" style={{background:'rgba(0,0,0,0.6)', padding:'8px 10px', border:'1px solid #335', borderRadius:6, color:'#cfe9ff', position:'relative'}}>
+          <div style={{fontWeight:700, marginBottom:4}}>Leverage</div>
+          <div>Total: {leverageMultiplier?.toFixed ? leverageMultiplier.toFixed(2) : Number(leverageMultiplier).toFixed(2)}</div>
+          <div style={{fontSize:11, opacity:0.85}}>Tip: higher leverage improves attack and economy</div>
+          <div style={{position:'absolute', top:6, right:8, fontSize:12, opacity:0.8}} title="Includes Territory, Research, Temp Buffs">ℹ️</div>
+          {/* Tooltip-like breakdown */}
+          {leverageDetail && (
+            <div style={{marginTop:6, padding:'6px 8px', background:'rgba(10,20,30,0.8)', border:'1px solid #446', borderRadius:6, fontSize:11}}>
+              <div style={{marginBottom:4, color:'#9bd4ff'}}>Top contributors</div>
+              {Object.entries(leverageDetail.bonuses || {}).sort((a:any,b:any)=> (b[1] as any).value - (a[1] as any).value).slice(0,3).map(([k,v]: any) => (
+                <div key={k} style={{display:'flex', justifyContent:'space-between'}}>
+                  <span style={{textTransform:'capitalize'}}>{k}</span>
+                  <span>+{((v.value||0)*100).toFixed(0)}%</span>
+                </div>
+              ))}
+              {!!leverageDetail.temp_buffs_detail && Object.keys(leverageDetail.temp_buffs_detail).length>0 && (
+                <div style={{marginTop:6, color:'#cfe9ff'}}>
+                  Temp buffs:
+                  {Object.entries(leverageDetail.temp_buffs_detail).map(([k,b]: any) => {
+                    const secs = Math.max(0, (b.expires_at*1000 - Date.now())/1000);
+                    return (
+                      <div key={k} style={{display:'flex', justifyContent:'space-between'}}>
+                        <span>{k.replace('_',' ')} ({(b.level*100).toFixed(0)}%)</span>
+                        <span>{Math.floor(secs)}s</span>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+        
+        {/* Performance Mode Controls */}
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          {performanceMode > 0 && (
+            <div style={{
+              background: performanceMode === 1 ? 'rgba(255, 165, 0, 0.9)' : 'rgba(255, 69, 0, 0.9)',
+              border: `2px solid ${performanceMode === 1 ? '#ffa500' : '#ff4500'}`,
+              borderRadius: '6px',
+              padding: '4px 8px',
+              color: '#fff',
+              fontSize: '11px',
+              fontWeight: 'bold'
+            }}>
+              {performanceMode === 1 ? '⚡ Reduced Graphics' : '🛡️ Minimal Graphics'}
+            </div>
+          )}
+          
+          {/* Emergency Recovery Buttons */}
+          <div style={{ display: 'flex', gap: '4px' }}>
+            <button 
+              onClick={() => setPerformanceMode(0)}
+              style={{
+                background: performanceMode === 0 ? '#44aa44' : '#666',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '4px 6px',
+                fontSize: '10px',
+                cursor: 'pointer'
+              }}
+              title="Full Graphics"
+            >
+              🎮
+            </button>
+            <button 
+              onClick={() => setPerformanceMode(1)}
+              style={{
+                background: performanceMode === 1 ? '#ff8800' : '#666',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '4px 6px',
+                fontSize: '10px',
+                cursor: 'pointer'
+              }}
+              title="Reduced Graphics"
+            >
+              ⚡
+            </button>
+            <button 
+              onClick={() => setPerformanceMode(2)}
+              style={{
+                background: performanceMode === 2 ? '#ff4400' : '#666',
+                color: '#fff',
+                border: 'none',
+                borderRadius: '4px',
+                padding: '4px 6px',
+                fontSize: '10px',
+                cursor: 'pointer'
+              }}
+              title="Minimal Graphics"
+            >
+              🛡️
+            </button>
+          </div>
+        </div>
+      </div>
+      
+      {/* Action Notifications */}
+      {renderMode === 'webgl' && actionNotifications.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          top: '20px',
+          right: '20px',
+          zIndex: 9998,
+          display: 'flex',
+          flexDirection: 'column',
+          gap: '8px'
+        }}>
+          {actionNotifications.map((notif) => (
+            <div key={notif.id} style={{
+              background: notif.type === 'success' ? 'rgba(40, 160, 40, 0.9)' : 
+                         notif.type === 'error' ? 'rgba(160, 40, 40, 0.9)' : 'rgba(40, 120, 160, 0.9)',
+              border: `2px solid ${notif.type === 'success' ? '#66ff66' : 
+                                  notif.type === 'error' ? '#ff6666' : '#66aaff'}`,
+              borderRadius: '8px',
+              padding: '12px 16px',
+              color: '#ffffff',
+              fontSize: '14px',
+              fontWeight: 'bold',
+              boxShadow: '0 4px 15px rgba(0,0,0,0.3)',
+              maxWidth: '300px',
+              opacity: Math.max(0.3, 1 - (Date.now() - notif.timestamp) / 5000)
+            }}>
+              {notif.type === 'success' ? '✅' : notif.type === 'error' ? '❌' : 'ℹ️'} {notif.message}
+            </div>
+          ))}
+        </div>
+      )}
+      
+
+      {/* Mission Tracker HUD */}
+      {!useSimpleRenderer && (
+        <div style={{
+          position: 'absolute',
+          top: '100px',
+          left: '20px',
+          width: '320px',
+          maxHeight: '500px',
+          overflow: 'auto',
+          background: 'rgba(0, 20, 40, 0.9)',
+          border: '2px solid #66aaff',
+          borderRadius: '10px',
+          padding: '15px',
+          color: '#cfe9ff',
+          boxShadow: '0 0 20px rgba(102, 170, 255, 0.3)',
+          zIndex: 999
+        }}>
+        {/* Combat Log Section */}
+        {combatLog.length > 0 && (
+          <div style={{ marginBottom: '15px' }}>
+            <h4 style={{margin: '0 0 8px 0', color: '#ff9966', fontSize: '14px', textAlign: 'center'}}>⚔️ Combat Log</h4>
+            <div style={{ maxHeight: '120px', overflow: 'auto', background: 'rgba(0, 0, 0, 0.4)', borderRadius: '6px', padding: '8px' }}>
+              {combatLog.slice(-5).map((log) => (
+                <div key={log.id} style={{ 
+                  fontSize: '11px', 
+                  marginBottom: '3px', 
+                  color: log.type === 'attack' ? '#ff9999' : log.type === 'defense' ? '#99ff99' : '#99ccff',
+                  opacity: Math.max(0.5, 1 - (Date.now() - log.timestamp) / 10000)
+                }}>
+                  {log.message}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+        
+        <h3 style={{margin: '0 0 12px 0', color: '#66aaff', fontSize: '16px', textAlign: 'center'}}>🎯 Active Missions</h3>
+        {(!activeCharacter?.missions || activeCharacter.missions.length === 0) ? (
+          <div style={{textAlign: 'center', color: '#888', fontSize: '12px', padding: '20px'}}>
+            No active missions.<br/>Click on planets to explore new opportunities!
+          </div>
+        ) : (
+          activeCharacter.missions.map((mission: any, idx: number) => (
+            <div key={idx} style={{
+              marginBottom: '12px',
+              padding: '10px',
+              background: 'rgba(0, 0, 0, 0.4)',
+              borderRadius: '6px',
+              border: '1px solid #446',
+              position: 'relative'
+            }}>
+              <div style={{color: '#99ddff', fontWeight: 'bold', fontSize: '14px', marginBottom: '6px'}}>
+                {mission.title || `Mission ${idx + 1}`}
+              </div>
+              <div style={{color: '#aaccee', fontSize: '12px', marginBottom: '8px'}}>
+                {mission.description || 'No description available'}
+              </div>
+              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'center'}}>
+                <div style={{
+                  background: 'rgba(102, 170, 255, 0.2)',
+                  borderRadius: '10px',
+                  padding: '2px 8px',
+                  fontSize: '11px',
+                  color: '#66aaff'
+                }}>
+                  {mission.type || 'Unknown'}
+                </div>
+                <div style={{fontSize: '11px', color: '#88ccff'}}>
+                  Progress: {Math.round((mission.progress || 0) * 100)}%
+                </div>
+              </div>
+              <div style={{
+                width: '100%',
+                height: '4px',
+                background: 'rgba(0, 0, 0, 0.5)',
+                borderRadius: '2px',
+                marginTop: '6px',
+                overflow: 'hidden'
+              }}>
+                <div style={{
+                  width: `${Math.round((mission.progress || 0) * 100)}%`,
+                  height: '100%',
+                  background: 'linear-gradient(90deg, #66aaff, #99ccff)',
+                  transition: 'width 0.3s ease'
+                }}></div>
+              </div>
+              {mission.reward && (
+                <div style={{fontSize: '11px', color: '#ffcc88', marginTop: '4px'}}>
+                  Reward: {mission.reward.amount} {mission.reward.type}
+                </div>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+      
+
+      
+      {/* Empty State Message */}
+      {renderMode === 'webgl' && demoTerritories.length === 0 && (
+        <div style={{position:'absolute',inset:0,display:'flex',alignItems:'center',justifyContent:'center',color:'#9cf'}}>No sectors visible. Use the HUD controls to reset view.</div>
+      )}
+      
+
+      {/* Planet Action Panel */}
+      {renderMode === 'webgl' && selectedPlanet && galaxyView && (
+        <div className="territory-panel" style={{
+          position: 'absolute',
+          top: '100px',
+          right: '20px',
+          width: '350px',
+          maxHeight: '80vh',
+          overflow: 'auto',
+          background: 'rgba(0, 15, 30, 0.95)',
+          border: '2px solid #88ccff',
+          borderRadius: '12px',
+          padding: '20px',
+          color: '#cfe9ff',
+          boxShadow: '0 0 30px rgba(136, 204, 255, 0.4)',
+          backdropFilter: 'blur(8px)',
+          zIndex: 1000,
+          fontSize: '14px'
+        }}>
+          <h3 style={{margin: '0 0 15px 0', color: '#9bd4ff', fontSize: '18px', textAlign: 'center', textShadow: '0 0 10px rgba(155, 212, 255, 0.5)'}}>{selectedPlanet.name}</h3>
+          
+          {/* Planet Status */}
+          <div style={{marginBottom: 15, padding: '10px', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '6px', border: '1px solid #446'}}>
+            <div style={{color:'#9cf', marginBottom:8, fontWeight: 'bold'}}>
+              Owner: <span style={{color: isFriendlyOwner(selectedPlanet.controlledBy) ? '#66ff66' : selectedPlanet.controlledBy ? '#ff6666' : '#ffaa44'}}>
+                {selectedPlanet.controlledBy || 'Unclaimed'}
+              </span>
+            </div>
+            <div style={{color:'#ccf', marginBottom:8}}>Defense: <span style={{color: '#88ccff', fontWeight: 'bold'}}>{selectedPlanet.defense ?? 0}</span></div>
+            <div style={{color:'#cfe9ff', fontSize:12}}>Research: Attack Boost Lvl <span style={{color: '#88ffcc'}}>{researchLevel.toFixed(2)}</span></div>
+            <div style={{color:'#ffcc88', fontSize:12, marginTop: 4}}>
+              Status: {isFriendlyOwner(selectedPlanet.controlledBy) ? '🏠 Friendly' : selectedPlanet.controlledBy ? '⚔️ Enemy' : '🌍 Neutral'}
+            </div>
+          </div>
+          <div style={{display:'flex', gap:8, marginBottom:8}}>
+            <button 
+              className="action-btn" 
+              disabled={!isFriendlyOwner(selectedPlanet.controlledBy)}
+              style={{
+                background: !isFriendlyOwner(selectedPlanet.controlledBy) ? 'linear-gradient(135deg, #666, #444)' : 'linear-gradient(135deg, #44aa66, #228844)',
+                border: `2px solid ${!isFriendlyOwner(selectedPlanet.controlledBy) ? '#888' : '#66cc88'}`,
+                color: !isFriendlyOwner(selectedPlanet.controlledBy) ? '#ccc' : '#fff',
+                cursor: !isFriendlyOwner(selectedPlanet.controlledBy) ? 'not-allowed' : 'pointer',
+                opacity: !isFriendlyOwner(selectedPlanet.controlledBy) ? 0.6 : 1,
+                padding: '8px 12px',
+                fontSize: '12px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                minHeight: '60px',
+                justifyContent: 'center'
+              }}
+              onClick={() => {
+                if (!isFriendlyOwner(selectedPlanet.controlledBy)) {
+                  showNotification(`❌ Cannot harvest enemy planet! You must control ${selectedPlanet.name} to harvest its resources.`, 'error');
+                  return;
+                }
+                
+                // Visual beam plus server-side harvest
+                const source = getNearestFriendlyPlanet(selectedPlanet.id);
+                const toPos = getPlanetPosition(selectedPlanet.id) || [0,0,0];
+                if (source && toPos) {
+                  const fromPos = [source.position.x, source.position.y, source.position.z] as [number,number,number];
+                  const id = `beam-${Date.now()}`;
+                  setActiveBeams(prev => [...prev, { id, from: fromPos, to: toPos, type: 'energy' }]);
+                  setTimeout(() => setActiveBeams(prev => prev.filter(b => b.id !== id)), 2500);
+                }
+                showNotification(`💎 Harvesting Resources! Collecting Energy and Minerals from ${selectedPlanet.name}...`, 'info');
+                try { harvestPlanet(selectedPlanet.id); } catch {}
+                // Local FX
+                try {
+                  const pos = selectedPlanet.position || { x: toPos[0], y: toPos[1], z: toPos[2] };
+                  window.dispatchEvent(new CustomEvent('territory-action', { detail: { territoryId: selectedPlanet.id, action: 'harvest', position: pos } } as any));
+                } catch {}
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '2px' }}>
+                <span style={{ fontSize: '16px' }}>⛏️</span>
+                <span style={{ fontWeight: 'bold' }}>Harvest Resources</span>
+              </div>
+              <div style={{ fontSize: '10px', opacity: 0.9, textAlign: 'center', lineHeight: '1.3' }}>
+                {!isFriendlyOwner(selectedPlanet.controlledBy) ? 
+                  'Must control planet' :
+                  'Gather Energy & Minerals'
+                }
+                {isFriendlyOwner(selectedPlanet.controlledBy) && (
+                  <div style={{ fontSize: '9px', opacity: 0.7, marginTop: '1px' }}>
+                    Free operation, no cost
+                  </div>
+                )}
+              </div>
+            </button>
+            <button 
+              className="action-btn" 
+              disabled={stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)}
+              style={{
+                background: (stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)) ? 'linear-gradient(135deg, #666, #444)' : 'linear-gradient(135deg, #6699ff, #4477dd)',
+                border: `2px solid ${(stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)) ? '#888' : '#88aaff'}`,
+                color: (stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)) ? '#ccc' : '#fff',
+                cursor: (stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)) ? 'not-allowed' : 'pointer',
+                opacity: (stockpile.minerals < 25 || !isFriendlyOwner(selectedPlanet.controlledBy)) ? 0.6 : 1,
+                padding: '8px 12px',
+                fontSize: '12px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                minHeight: '60px',
+                justifyContent: 'center'
+              }}
+              onClick={() => {
+                if (stockpile.minerals < 25) {
+                  showNotification(`❌ Insufficient Minerals! Need 25 Minerals to build satellite defense. (Current: ${stockpile.minerals})`, 'error');
+                  return;
+                }
+                if (!isFriendlyOwner(selectedPlanet.controlledBy)) {
+                  showNotification(`❌ Cannot build on enemy planet! You must control ${selectedPlanet.name} to build satellite defenses.`, 'error');
+                  return;
+                }
+                
+                const currentDefense = selectedPlanet.defense || 0;
+                const newDefense = currentDefense + 1;
+                showNotification(`🛡️ Satellite Built! Defense increased: ${currentDefense} → ${newDefense} (+1) | Cost: -25 Minerals`, 'success');
+                
+                // Build satellite via server (defense up)
+                try { buildSatellite(selectedPlanet.id, 25); } catch {}
+                // Quick visual defense pulse
+                try {
+                  const pos = selectedPlanet.position || { x: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[0], y: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[1], z: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[2] };
+                  window.dispatchEvent(new CustomEvent('territory-action', { detail: { territoryId: selectedPlanet.id, action: 'defend', position: pos } } as any));
+                } catch {}
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '2px' }}>
+                <span style={{ fontSize: '16px' }}>🛡️</span>
+                <span style={{ fontWeight: 'bold' }}>Build Satellite</span>
+              </div>
+              <div style={{ fontSize: '10px', opacity: 0.9, textAlign: 'center', lineHeight: '1.3' }}>
+                {stockpile.minerals < 25 ? 
+                  `Need ${25 - stockpile.minerals} more Minerals` :
+                  !isFriendlyOwner(selectedPlanet.controlledBy) ? 
+                    'Must control planet' :
+                    'Cost: 25 Minerals | +1 Defense'
+                }
+                {(stockpile.minerals >= 25 && isFriendlyOwner(selectedPlanet.controlledBy)) && (
+                  <div style={{ fontSize: '9px', opacity: 0.7, marginTop: '1px' }}>
+                    Current defense: {selectedPlanet.defense || 0}
+                  </div>
+                )}
+              </div>
+            </button>
+            <button 
+              className="action-btn" 
+              disabled={stockpile.energy < 20}
+              style={{
+                background: (stockpile.energy < 20) ? 'linear-gradient(135deg, #666, #444)' : 'linear-gradient(135deg, #aa66cc, #884499)',
+                border: `2px solid ${(stockpile.energy < 20) ? '#888' : '#cc88ee'}`,
+                color: (stockpile.energy < 20) ? '#ccc' : '#fff',
+                cursor: (stockpile.energy < 20) ? 'not-allowed' : 'pointer',
+                opacity: (stockpile.energy < 20) ? 0.6 : 1,
+                padding: '8px 12px',
+                fontSize: '12px',
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                minHeight: '60px',
+                justifyContent: 'center'
+              }}
+              onClick={() => {
+                if (stockpile.energy < 20) {
+                  showNotification(`❌ Insufficient Energy! Need 20 Energy to deploy attack boost research. (Current: ${stockpile.energy})`, 'error');
+                  return;
+                }
+                
+                const currentLevel = researchLevel;
+                const newLevel = currentLevel + 0.05;
+                showNotification(`🔬 Research Deployed! Attack boost increased: ${(currentLevel * 100).toFixed(0)}% → ${(newLevel * 100).toFixed(0)}% (+5%) | Cost: -20 Energy`, 'success');
+                
+                // Deploy research boost server-side; local FX
+                try { deployResearch('attack_boost', 20); } catch {}
+                try {
+                  const pos = selectedPlanet.position || { x: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[0], y: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[1], z: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[2] };
+                  window.dispatchEvent(new CustomEvent('territory-action', { detail: { territoryId: selectedPlanet.id, action: 'research', position: pos } } as any));
+                } catch {}
+              }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: '4px', marginBottom: '2px' }}>
+                <span style={{ fontSize: '16px' }}>🔬</span>
+                <span style={{ fontWeight: 'bold' }}>Deploy Research</span>
+              </div>
+              <div style={{ fontSize: '10px', opacity: 0.9, textAlign: 'center', lineHeight: '1.3' }}>
+                {stockpile.energy < 20 ? 
+                  `Need ${20 - stockpile.energy} more Energy` :
+                  `Cost: 20 Energy | +5% Attack Power`
+                }
+                {stockpile.energy >= 20 && (
+                  <div style={{ fontSize: '9px', opacity: 0.7, marginTop: '1px' }}>
+                    Current boost: {(researchLevel * 100).toFixed(0)}%
+                  </div>
+                )}
+              </div>
+            </button>
+          </div>
+          <div style={{display:'flex', gap:6, flexWrap:'wrap', marginBottom:8}}>
+            <button className="action-btn" onClick={() => setShowHarvestHelp(v=>!v)} style={{padding:'4px 6px'}}>Harvest explainer</button>
+            <button className="action-btn" onClick={() => setShowDefenseHelp(v=>!v)} style={{padding:'4px 6px'}}>Defense explainer</button>
+            <button className="action-btn" onClick={() => setShowResearchHelp(v=>!v)} style={{padding:'4px 6px'}}>Research explainer</button>
+            <button className="action-btn" onClick={() => {
+              try {
+                const pos = selectedPlanet.position || { x: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[0], y: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[1], z: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[2] };
+                window.dispatchEvent(new CustomEvent('center-camera', { detail: { x: pos.x||pos[0], y: pos.y||pos[1], z: pos.z||pos[2], force: true } } as any));
+              } catch {}
+            }} style={{padding:'4px 6px'}}>Center to target</button>
+          </div>
+          {showHarvestHelp && (
+            <div style={{ fontSize:12, color:'#cfe9ff', marginBottom:8, padding:'8px', background:'rgba(68, 170, 102, 0.2)', borderRadius:'6px', border:'1px solid #44aa66' }}>
+              <div style={{fontWeight:'bold', marginBottom:'4px', color:'#66cc88'}}>⛏️ Harvest System:</div>
+              Harvest sends energy beams from your controlled planets to gather <span style={{color:'#ffaa44'}}>Energy</span> and <span style={{color:'#88aaff'}}>Minerals</span>. 
+              <span style={{color:'#ffaa44'}}>Energy</span> fuels research deployments, <span style={{color:'#88aaff'}}>Minerals</span> build satellite defenses. 
+              <div style={{marginTop:'4px', fontSize:'11px', opacity:'0.8'}}>💡 Tip: Harvest regularly to maintain resources for upgrades!</div>
+            </div>
+          )}
+          {showDefenseHelp && (
+            <div style={{ fontSize:12, color:'#cfe9ff', marginBottom:8, padding:'8px', background:'rgba(102, 153, 255, 0.2)', borderRadius:'6px', border:'1px solid #6699ff' }}>
+              <div style={{fontWeight:'bold', marginBottom:'4px', color:'#88aaff'}}>🛡️ Defense System:</div>
+              Satellites create defensive rings around planets, increasing defense rating. Each satellite costs <span style={{color:'#88aaff'}}>25 Minerals</span> and adds <span style={{color:'#66ff66'}}>+1 Defense</span>. 
+              Higher defense makes planets harder to capture and reduces attacker effectiveness. 
+              <div style={{marginTop:'4px', fontSize:'11px', opacity:'0.8'}}>💡 Tip: Fortify key strategic planets with multiple satellites!</div>
+            </div>
+          )}
+          {showResearchHelp && (
+            <div style={{ fontSize:12, color:'#cfe9ff', marginBottom:8, padding:'8px', background:'rgba(170, 102, 204, 0.2)', borderRadius:'6px', border:'1px solid #aa66cc' }}>
+              <div style={{fontWeight:'bold', marginBottom:'4px', color:'#cc88ee'}}>🔬 Research System:</div>
+              Research boosts your attack power permanently. Each deployment costs <span style={{color:'#ffaa44'}}>20 Energy</span> and increases attack by <span style={{color:'#66ff66'}}>+5%</span>. 
+              Higher research levels make your attacks more effective against enemy defenses. 
+              <div style={{marginTop:'4px', fontSize:'11px', opacity:'0.8'}}>💡 Tip: Deploy research before major offensives for maximum impact!</div>
+            </div>
+          )}
+              {/* Source selector and amount */}
+              <div style={{ marginBottom: 12 }}>
+            <div style={{ marginBottom: 6, color: '#cfe9ff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <span>🚀 Source Planets ({selectedSourcePlanetIds.length} selected)</span>
+              <button 
+                onClick={() => {
+                  const allPlanets = (world?.galaxies?.[0]?.systems || []).flatMap((s: any) => s.planets || []);
+                  const ownedPlanets = allPlanets.filter((pp: any) => isFriendlyOwner(pp.controlledBy));
+                  setSelectedSourcePlanetIds(ownedPlanets.map((p: any) => p.id));
+                }}
+                style={{ 
+                  fontSize: '10px', padding: '2px 6px', background: '#1a4a5c', color: '#88ccff', 
+                  border: '1px solid #88ccff', borderRadius: 3, cursor: 'pointer' 
+                }}
+              >
+                Select All
+              </button>
+            </div>
+                <select
+              multiple
+              value={selectedSourcePlanetIds}
+              onChange={(e) => setSelectedSourcePlanetIds(Array.from(e.target.selectedOptions).map(o => o.value))}
+              style={{ width: '100%', padding: '8px', background:'#021624', color:'#cfe9ff', border:'1px solid #88ccff', borderRadius: 6, height: 110 }}
+                >
+                  {(world?.galaxies?.[0]?.systems || []).flatMap((s: any) => s.planets || [])
+                    .filter((pp: any) => isFriendlyOwner(pp.controlledBy))
+                    .map((pp: any) => (
+                      <option key={pp.id} value={pp.id}>
+                        🌍 {pp.name} (Defense: {pp.defense || 0})
+                      </option>
+                    ))}
+                </select>
+            {selectedSourcePlanetIds.length > 0 && (
+              <div style={{ marginTop: 6, padding: '6px', background: 'rgba(0, 40, 60, 0.6)', borderRadius: 4, fontSize: 11 }}>
+                <div style={{ color: '#88ccff', marginBottom: 4 }}>📊 Source Summary:</div>
+                <div style={{ color: '#cfe9ff' }}>
+                  Total Defense: {(world?.galaxies?.[0]?.systems || []).flatMap((s: any) => s.planets || [])
+                    .filter((pp: any) => selectedSourcePlanetIds.includes(pp.id))
+                    .reduce((sum: number, p: any) => sum + (p.defense || 0), 0)}
+                </div>
+                <div style={{ color: '#cfe9ff' }}>
+                  Combined Attack Power: {(sendAmount * selectedSourcePlanetIds.length * Number(leverageMultiplier)).toFixed(0)}
+                </div>
+              </div>
+            )}
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <div style={{ display:'flex', justifyContent:'space-between', color:'#cfe9ff' }}>
+                  <span>Seedlings</span>
+                  <span>{sendAmount}</span>
+                </div>
+                <input type="range" min={10} max={200} step={10} value={sendAmount} onChange={(e) => setSendAmount(parseInt(e.target.value))} style={{ width:'100%' }} />
+              </div>
+          {attackEstimate && (
+            <div style={{ marginBottom: 10, padding: '8px', background: 'rgba(0, 0, 0, 0.3)', borderRadius: '6px' }}>
+              <div style={{ display:'flex', gap:8, alignItems:'center', marginBottom: 6 }}>
+                <span style={{ 
+                  padding:'4px 8px', 
+                  borderRadius:6, 
+                  background: attackEstimate?.verdict==='Win'?'#1f6f43':attackEstimate?.verdict==='Close'?'#6f621f':'#6f1f1f', 
+                  color:'#fff',
+                  fontWeight: 'bold'
+                }}>
+                  {attackEstimate?.verdict || 'Unknown'}
+                </span>
+                <span style={{ color:'#cfe9ff', fontSize:13, fontWeight: 'bold' }}>
+                  {attackEstimate?.power?.toFixed(0) || '0'} vs {attackEstimate?.defense?.toFixed(0) || '0'}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: '#aaccee' }}>
+                Units: {sendAmount} × Leverage: {leverageMultiplier?.toFixed ? leverageMultiplier.toFixed(2) : Number(leverageMultiplier).toFixed(2)} = {(sendAmount * Number(leverageMultiplier)).toFixed(0)} effective power
+              </div>
+              <div style={{ fontSize: 11, color: '#ccaaee' }}>
+                Defense: {selectedPlanet.defense ?? 0} × 30 = {((selectedPlanet.defense ?? 0) * 30).toFixed(0)} defensive power
+              </div>
+            </div>
+          )}
+          {lastOutcome && selectedPlanet && lastOutcome.planetId === selectedPlanet.id && (
+            <div style={{ 
+              marginBottom: 10, 
+              padding: '8px', 
+              background: lastOutcome?.success ? 'rgba(143, 228, 180, 0.2)' : 'rgba(255, 170, 170, 0.2)', 
+              border: `1px solid ${lastOutcome?.success ? '#8fe4b4' : '#ffaaaa'}`,
+              borderRadius: '6px',
+              color: lastOutcome?.success ? '#8fe4b4' : '#ffaaaa', 
+              fontWeight: 600, 
+              fontSize: 12 
+            }}>
+              <div style={{ marginBottom: 4 }}>
+                {lastOutcome?.success ? '🏆 Victory! Planet Captured' : '🛡️ Defense Held Strong'}
+              </div>
+              {(lastOutcome as any)?.attack_power && (lastOutcome as any)?.defense_power && (
+                <div style={{ fontSize: 10, opacity: 0.8 }}>
+                  Final: {((lastOutcome as any)?.attack_power || 0).toFixed(0)} vs {((lastOutcome as any)?.defense_power || 0).toFixed(0)}
+                  {(lastOutcome as any)?.leverage_used && ` (Leverage: ${((lastOutcome as any)?.leverage_used || 1).toFixed(2)})`}
+                </div>
+              )}
+            </div>
+          )}
+          <div style={{ marginTop: 6 }}>
+            <button className="action-btn" onClick={() => setShowBattleHelp(v=>!v)} style={{padding:'6px 8px'}}>
+              {showBattleHelp ? 'Hide battle explainer' : 'Show battle explainer'}
+            </button>
+            {showBattleHelp && (
+              <div style={{marginTop:8, fontSize:12, color:'#cfe9ff', lineHeight:1.35}}>
+                - When you attack, a local skirmish begins at the target immediately with a brief warm-up.<br/>
+                - Your seedlings travel along green arcs; when they arrive, attackers ramp up.<br/>
+                - Leverage and distance modify Attack Power; the verdict shows likely outcome.<br/>
+                - Counters above the planet show current attackers/defenders.
+              </div>
+            )}
+              </div>
+              <div style={{display:'flex', gap:8, flexWrap:'wrap', marginBottom:12}}>
+                {(selectedPlanet.resources || []).map((r: any, i: number) => (
+                  <span key={i} className="resource-tag">{r.type}: {r.amount}</span>
+                ))}
+              </div>
+              <div style={{color:'#9bd4ff', marginBottom:12, fontSize:12}}>
+                System: {selectedPlanet.systemId} • Population: {selectedPlanet.population ?? 0}
+              </div>
+        {/* Combat Section */}
+        <div style={{marginBottom: 15, padding: '12px', background: 'rgba(40, 0, 0, 0.4)', borderRadius: '8px', border: '1px solid #ff6666'}}>
+          <h4 style={{margin: '0 0 10px 0', color: '#ff9999', fontSize: '16px'}}>⚔️ Combat Operations</h4>
+          
+          {/* Source Planet Info */}
+          <div style={{marginBottom: 10, padding: '8px', background: 'rgba(0, 40, 0, 0.4)', borderRadius: '6px', border: '1px solid #66ff66'}}>
+            <div style={{color: '#99ff99', fontSize: '12px', fontWeight: 'bold', marginBottom: 4}}>🚀 Attack Sources:</div>
+            {selectedSourcePlanetIds && selectedSourcePlanetIds.length > 0 ? (
+              <div style={{fontSize: '11px', color: '#aaffaa'}}>
+                {selectedSourcePlanetIds.map((id, i) => {
+                  const planet = getPlanetById(id);
+                  return planet ? `${planet.name || id}${i < selectedSourcePlanetIds.length - 1 ? ', ' : ''}` : id;
+                }).join('')} ({selectedSourcePlanetIds.length} planet{selectedSourcePlanetIds.length > 1 ? 's' : ''})
+              </div>
+            ) : selectedSourcePlanetId ? (
+              <div style={{fontSize: '11px', color: '#aaffaa'}}>
+                {getPlanetById(selectedSourcePlanetId)?.name || selectedSourcePlanetId}
+              </div>
+            ) : (
+              <div style={{fontSize: '11px', color: '#ffaaaa'}}>No source selected - will auto-select nearest friendly planet</div>
+            )}
+          </div>
+          
+        <div className="action-buttons" style={{display: 'flex', flexDirection: 'column', gap: '10px'}}>
+          {!isFriendlyOwner(selectedPlanet.controlledBy) ? (
+            <button onClick={() => {
+              const sources = (selectedSourcePlanetIds && selectedSourcePlanetIds.length > 0)
+                ? selectedSourcePlanetIds
+                : (selectedSourcePlanetId ? [selectedSourcePlanetId] : []);
+              
+              if (!selectedPlanet || sources.length === 0) {
+                showNotification('No attack source selected! Please select a friendly planet first.', 'error');
+                return;
+              }
+              
+              const perSource = Math.max(1, Math.floor(sendAmount / sources.length));
+              const toPos = getPlanetPosition(selectedPlanet.id) || [0,0,0];
+              
+              // Enhanced attack feedback with detailed source info
+              const sourceDetails = sources.map(id => {
+                const p = getPlanetById(id);
+                return p ? `${p.name} (Def: ${p.defense || 0})` : id;
+              });
+              const sourceSummary = sourceDetails.length > 2 ? 
+                `${sourceDetails.slice(0, 2).join(', ')} (+${sourceDetails.length - 2} more)` : 
+                sourceDetails.join(', ');
+              
+              showNotification(
+                `🚀 Attack launched: ${sendAmount} units from [${sourceSummary}] → ${selectedPlanet.name} (${(sendAmount * Number(leverageMultiplier)).toFixed(0)} effective power)`, 
+                'info'
+              );
+              
+              sources.forEach((fromId) => {
+                attackPlanet(fromId, selectedPlanet.id, perSource);
+                const fromPos = getPlanetPosition(fromId) || [0,0,0];
+                if (typeof window !== 'undefined') {
+                  window.dispatchEvent(new CustomEvent('units-moved', { detail: {
+                    from_id: fromId, to_id: selectedPlanet.id, amount: perSource,
+                    from_position: { x: fromPos[0], y: fromPos[1], z: fromPos[2] },
+                    to_position: { x: toPos[0], y: toPos[1], z: toPos[2] }, eta_ms: 12000,
+                    owner: playerId || 'player'
+                  }} as any));
+                }
+                if (combatSystem) {
+                  const attacker: Character = {
+                    id: fromId,
+                    name: 'Attacker',
+                    level: 1,
+                    traits: [],
+                    publicKey: {} as any,
+                    faction: 'player',
+                    position: new THREE.Vector3(...fromPos),
+                    experience: 0,
+                    resources: {}
+                  };
+                  const defender: Character = {
+                    id: selectedPlanet.id,
+                    name: 'Defender',
+                    level: 1,
+                    traits: [],
+                    publicKey: {} as any,
+                    experience: 0,
+                    resources: {},
+                    faction: 'enemy',
+                    position: new THREE.Vector3(...toPos)
+                  };
+                  combatSystem.initiateCombat(attacker, defender);
+                }
+              });
+            }} style={{
+              width: '100%',
+              padding: '12px 20px',
+              background: 'linear-gradient(135deg, #ff4444, #cc2222)',
+              border: '2px solid #ff6666',
+              borderRadius: '8px',
+              color: '#ffffff',
+              fontSize: '16px',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+              textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+              boxShadow: '0 4px 12px rgba(255, 68, 68, 0.4)',
+              transition: 'all 0.2s ease'
+            }} 
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'linear-gradient(135deg, #ff6666, #ee3333)';
+              e.currentTarget.style.transform = 'translateY(-2px)';
+              e.currentTarget.style.boxShadow = '0 6px 20px rgba(255, 68, 68, 0.6)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'linear-gradient(135deg, #ff4444, #cc2222)';
+              e.currentTarget.style.transform = 'translateY(0px)';
+              e.currentTarget.style.boxShadow = '0 4px 12px rgba(255, 68, 68, 0.4)';
+            }}>⚔️ ATTACK PLANET</button>
+          ) : (
+            <button onClick={() => {
+              const toPos = selectedPlanet.position ? selectedPlanet.position : { x: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[0], y: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[1], z: (idToPositionRef.current[selectedPlanet.id]||[0,0,0])[2] };
+              const source = getPlanetById(selectedSourcePlanetId) || getNearestFriendlyPlanet(selectedPlanet.id);
+              const fromPos = source?.position || getHomePosition(selectedPlanet.id) || { x: 0, y: 0, z: 0 };
+              const fromId = source?.id || selectedSourcePlanetId || 'unknown';
+              if (typeof window !== 'undefined') {
+                 window.dispatchEvent(new CustomEvent('units-moved', { detail: {
+                  from_id: fromId, to_id: selectedPlanet.id, amount: sendAmount,
+                  from_position: fromPos, to_position: toPos, eta_ms: 12000
+                }} as any));
+              }
+              if (fromId && fromId !== 'unknown') {
+                moveUnits(fromId, selectedPlanet.id, sendAmount);
+              }
+            }} style={{
+              width: '100%',
+              padding: '12px 20px',
+              background: 'linear-gradient(135deg, #44ff44, #22cc22)',
+              border: '2px solid #66ff66',
+              borderRadius: '8px',
+              color: '#ffffff',
+              fontSize: '16px',
+              fontWeight: 'bold',
+              cursor: 'pointer',
+              textShadow: '0 1px 2px rgba(0,0,0,0.5)',
+              boxShadow: '0 4px 12px rgba(68, 255, 68, 0.4)',
+              transition: 'all 0.2s ease'
+            }}
+            onMouseEnter={(e) => {
+              e.currentTarget.style.background = 'linear-gradient(135deg, #66ff66, #33ee33)';
+              e.currentTarget.style.transform = 'translateY(-2px)';
+            }}
+            onMouseLeave={(e) => {
+              e.currentTarget.style.background = 'linear-gradient(135deg, #44ff44, #22cc22)';
+              e.currentTarget.style.transform = 'translateY(0px)';
+            }}>🪐 SEND SEEDLINGS</button>
+          )}
+          </div>
+        </div>
+        <button onClick={() => setSelectedPlanet(null)} style={{
+          position: 'absolute',
+          top: '10px',
+          right: '10px',
+          background: 'rgba(255, 100, 100, 0.8)',
+          border: '1px solid #ff6666',
+          borderRadius: '50%',
+          width: '30px',
+          height: '30px',
+          color: '#ffffff',
+          fontSize: '16px',
+          cursor: 'pointer',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center'
+        }}>✕</button>
+        </div>
+      )}
+
+            camera={{ position: [0, 70, 0], fov: 75 }} 
+            onCreated={({ camera, gl }) => { 
+              (window as any).__r3f_cam__ = camera;
+              globalWebGLRenderer = gl;
+            }}
+            gl={{ 
+              alpha: false,
+              antialias: false,
+              depth: true,
+              stencil: false,
+              powerPreference: "low-power",
+              preserveDrawingBuffer: false,
+              failIfMajorPerformanceCaveat: true
+            }}
+            dpr={Math.min(1, window.devicePixelRatio || 1)}
+          >
+            <OrbitControls 
+              enablePan={true}
+              enableZoom={true}
+              enableRotate={true}
+              minDistance={3}
+              maxDistance={120}
+              makeDefault
+            />
+            
+            {/* Lighting setup */}
+            <ambientLight intensity={0.4} />
+            <pointLight position={[10, 10, 10]} intensity={1.5} color="#ffffff" />
+            
+            <Suspense fallback={<Html center>Loading Universe...</Html>}>
+              {/* Minimal stars only */}
+              <Stars
+                radius={50}
+                depth={20}
+                count={200}
+                factor={1}
+                saturation={0}
+                fade={false}
+                speed={0.1}
+              />
+
+              {/* Basic fallback scene when no content */}
+              <mesh position={[0, 0, 0]}>
+                <sphereGeometry args={[2, 32, 32]} />
+                <meshStandardMaterial color="#4CAF50" />
+              </mesh>
+              <Text position={[0, 3, 0]} fontSize={1} color="#ffffff" anchorX="center" anchorY="middle">
+                HoneyComb Protocol
+              </Text>
+            </Suspense>
+          </Canvas>
+        </div>
+      )}
+    </div>
+  );
+};
+
+export default GameWorld;
