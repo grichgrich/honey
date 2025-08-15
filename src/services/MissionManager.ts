@@ -135,7 +135,7 @@ export class MissionManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Created mission: \${mission.title}\`);
+      console.log('Created mission: ' + mission.title);
       return missionAddress.toString();
     } catch (error) {
       console.error('Error creating mission:', error);
@@ -167,7 +167,7 @@ export class MissionManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Started mission \${missionAddress} with character \${characterAddress}\`);
+      console.log('Started mission ' + missionAddress + ' with character ' + characterAddress);
     } catch (error) {
       console.error('Error starting mission:', error);
       throw error;
@@ -198,7 +198,7 @@ export class MissionManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Completed mission \${missionAddress} with character \${characterAddress}\`);
+      console.log('Completed mission ' + missionAddress + ' with character ' + characterAddress);
     } catch (error) {
       console.error('Error completing mission:', error);
       throw error;

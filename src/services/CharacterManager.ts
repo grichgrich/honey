@@ -126,7 +126,7 @@ export class CharacterManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Created character for \${owner}\`);
+      console.log('Created character for ' + owner);
       return characterAddress.toString();
     } catch (error) {
       console.error('Error creating character:', error);
@@ -159,7 +159,7 @@ export class CharacterManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Updated traits for character \${characterAddress}\`);
+      console.log('Updated traits for character ' + characterAddress);
     } catch (error) {
       console.error('Error updating character traits:', error);
       throw error;
@@ -192,7 +192,7 @@ export class CharacterManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Equipped resource on character \${characterAddress}\`);
+      console.log('Equipped resource on character ' + characterAddress);
     } catch (error) {
       console.error('Error equipping resource:', error);
       throw error;
@@ -225,7 +225,7 @@ export class CharacterManager {
       });
 
       await sendClientTransactions(this.client, { publicKey: authority }, txResponse);
-      console.log(\`Unequipped resource from character \${characterAddress}\`);
+      console.log('Unequipped resource from character ' + characterAddress);
     } catch (error) {
       console.error('Error unequipping resource:', error);
       throw error;
