@@ -5,11 +5,26 @@ export const SERVER_CONFIG = {
   // Set to true to enable WebSocket connection attempts
   ENABLE_WEBSOCKET: true, // Enabled to connect to the backend server
   
-  // WebSocket URL - only used if ENABLE_WEBSOCKET is true
-  WEBSOCKET_URL: 'ws://localhost:8001/ws',
+  // API base URL and WS URL can be injected at build-time via Vite env
+  API_BASE_URL: (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL)
+    || (typeof window !== 'undefined' ? `${window.location.protocol}//${window.location.hostname}:8001` : 'http://localhost:8001'),
   
-  // API base URL - only used if ENABLE_WEBSOCKET is true
-  API_BASE_URL: 'http://localhost:8001',
+  WEBSOCKET_URL: (() => {
+    const envWs = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_WS_URL) as string | undefined;
+    if (envWs) return envWs;
+    const api = (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_API_BASE_URL) as string | undefined;
+    if (api) {
+      try {
+        const u = new URL(api);
+        const wsScheme = u.protocol === 'https:' ? 'wss:' : 'ws:';
+        return `${wsScheme}//${u.host}/ws`;
+      } catch {}
+    }
+    if (typeof window !== 'undefined') {
+      return `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.hostname}:8001/ws`;
+    }
+    return 'ws://localhost:8001/ws';
+  })(),
   
   // Maximum number of reconnection attempts
   MAX_RECONNECT_ATTEMPTS: 1,
